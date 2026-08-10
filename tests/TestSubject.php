@@ -12,7 +12,7 @@ namespace Techork\Saga\Tests;
  * since {@see \Techork\Saga\InMemorySagaStateRepository} keeps the same
  * instance, but the contract is preserved).
  */
-final class TestSubject
+class TestSubject
 {
     public string $path = '';
 

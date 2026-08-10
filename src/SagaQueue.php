@@ -13,6 +13,12 @@ namespace Techork\Saga;
  */
 interface SagaQueue
 {
-    /** @param class-string<Saga> $sagaClass */
-    public function push(string $sagaClass, string $sagaId, string $transition): void;
+    /**
+     * @param  class-string<Saga>  $sagaClass
+     * @param  non-negative-int  $delaySeconds  earliest time the step may run, relative to now.
+     *                                          0 means "as soon as a worker is free". Implementations
+     *                                          that cannot delay may ignore it, but then a saga cannot
+     *                                          express deadlines or back off from a contended step.
+     */
+    public function push(string $sagaClass, string $sagaId, string $transition, int $delaySeconds = 0): void;
 }

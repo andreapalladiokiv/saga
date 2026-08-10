@@ -27,4 +27,5 @@ use Symfony\Component\Workflow\Definition;
 interface Saga
 {
     public function definition(): Definition;
+
 }

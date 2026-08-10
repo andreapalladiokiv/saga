@@ -4,9 +4,13 @@
     "type": "library",
     "license": "MIT",
     "require": {
-        "php": ">=8.2",
-        "symfony/workflow": "^8.0",
-        "symfony/event-dispatcher": "^7.0 || ^8.0"
+        "php": "^8.2",
+        "psr/clock": "^1.0",
+        "psr/log": "^1.0 || ^2.0 || ^3.0",
+        "symfony/workflow": "^7.0 || ^8.0",
+        "symfony/event-dispatcher": "^7.0 || ^8.0",
+        "symfony/event-dispatcher-contracts": "^3.0",
+        "symfony/polyfill-php84": "^1.31"
     },
     "autoload": {
         "psr-4": {
@@ -23,14 +27,21 @@
         "illuminate/contracts": "^13.0",
         "illuminate/support": "^13.0",
         "illuminate/bus": "^13.0",
-        "illuminate/queue": "^13.0"
+        "illuminate/cache": "^13.0",
+        "illuminate/database": "^13.0",
+        "illuminate/queue": "^13.0",
+        "illuminate/events": "^13.0",
+        "phpstan/phpstan": "^2.1",
+        "illuminate/encryption": "^13.0"
     },
     "suggest": {
         "illuminate/bus": "Required for Saga\\Laravel integration (^10 || ^11 || ^12 || ^13)",
         "illuminate/queue": "Required for Saga\\Laravel integration (^10 || ^11 || ^12 || ^13)",
         "illuminate/contracts": "Required for Saga\\Laravel integration (^10 || ^11 || ^12 || ^13)",
         "illuminate/support": "Required for the optional SagaServiceProvider (^10 || ^11 || ^12 || ^13)",
-        "symfony/event-dispatcher": "Required for the optional event dispatcher (^7.0 || ^8.0)"
+        "illuminate/cache": "Required for CacheSagaLock, which serialises the steps of one saga. The configured store must support atomic locks \u2014 redis, memcached, dynamodb, database or array; the file store cannot.",
+        "symfony/event-dispatcher": "Required for the optional event dispatcher (^7.0 || ^8.0)",
+        "illuminate/encryption": "Required for EncryptedSubjectCodec, which authenticates the stored subject so a forged payload is rejected before unserialize() constructs anything. Without it, anyone able to write the sagas table chooses which already-loaded class the queue worker instantiates."
     },
     "extra": {
         "laravel": {
@@ -38,5 +49,16 @@
                 "Techork\\Saga\\Laravel\\SagaServiceProvider"
             ]
         }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": [
+            "phpstan analyse -c phpstan.neon.dist --memory-limit=1G",
+            "phpstan analyse -c phpstan-tests.neon.dist --memory-limit=1G"
+        ],
+        "ci": [
+            "@analyse",
+            "@test"
+        ]
     }
 }
