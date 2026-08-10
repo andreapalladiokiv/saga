@@ -20,6 +20,7 @@ use Techork\Saga\InMemorySagaStateRepository;
 use Techork\Saga\InProcessSagaLock;
 use Techork\Saga\Laravel\SagaStepJob;
 use Techork\Saga\SagaConcurrencyException;
+use Techork\Saga\SagaDefinitionDriftException;
 use Techork\Saga\SagaFailedException;
 use Techork\Saga\SagaMarkingStore;
 use Techork\Saga\SagaRunner;
@@ -265,7 +266,7 @@ final class SagaStepJobTest extends TestCase
         self::assertSame(LogLevel::CRITICAL, $records[0]['level']);
         self::assertSame('Saga compensation failed', $records[0]['message']);
         self::assertSame('ord-1', $records[0]['context']['saga_id']);
-        self::assertSame('charge_card', $records[0]['context']['failed_transition']);
+        self::assertSame('charge_card', $records[0]['context']['transition']);
     }
 
     public function testFailedWorksWithoutALoggerBound(): void
@@ -283,6 +284,51 @@ final class SagaStepJobTest extends TestCase
 
         $this->expectException(SagaFailedException::class);
         (new SagaStepJob(OrderSaga::class, 'ord-1', 'charge_card'))->failed(new RuntimeException('nope'));
+    }
+
+    public function testFailedDoesNotCompensateWhenTheCodeNoLongerFitsTheSaga(): void
+    {
+        // SagaDefinitionDriftException exists precisely so a deploy does not roll
+        // sagas back: renaming a place strands every saga parked in it, and
+        // compensating 400 of them means issuing 400 refunds over a one-word
+        // rename. The exception was being raised and then ignored here.
+        $compensated = [];
+        $this->onCompensation('fork', $compensated);
+        $this->onCompensation('reserve_stock', $compensated);
+
+        $this->startAndAdvance();
+
+        (new SagaStepJob(OrderSaga::class, 'ord-1', 'charge_card'))->failed(
+            SagaDefinitionDriftException::unknownPlace('ord-1', 'pending_signal', ['a', 'b']),
+        );
+
+        self::assertSame([], $compensated, 'a deploy must not trigger a rollback');
+        self::assertNotNull($this->repository->load('ord-1'), 'and must not delete the saga');
+    }
+
+    public function testFailedLogsDriftSoItIsNotSilentlyDropped(): void
+    {
+        $records = [];
+        $this->container->instance(LoggerInterface::class, new class($records) extends AbstractLogger {
+            /** @param list<array{level: mixed, message: string, context: array}> $records */
+            public function __construct(private array &$records) {}
+
+            public function log($level, $message, array $context = []): void
+            {
+                $this->records[] = ['level' => $level, 'message' => (string) $message, 'context' => $context];
+            }
+        });
+
+        $this->startAndAdvance();
+
+        (new SagaStepJob(OrderSaga::class, 'ord-1', 'charge_card'))->failed(
+            SagaDefinitionDriftException::unknownTransition('ord-1', 'gone', ['a']),
+        );
+
+        self::assertCount(1, $records);
+        self::assertSame(LogLevel::CRITICAL, $records[0]['level']);
+        self::assertStringContainsString('needs attention', $records[0]['message']);
+        self::assertSame('ord-1', $records[0]['context']['saga_id']);
     }
 
     // ───────────── container plumbing (no laravel/framework present) ─────────────

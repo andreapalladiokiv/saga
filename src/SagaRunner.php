@@ -20,6 +20,7 @@ use function array_unique;
 use function array_values;
 use function count;
 use function in_array;
+use function str_starts_with;
 
 /**
  * Drives a Symfony Workflow saga: one transition per invocation.
@@ -33,7 +34,7 @@ use function in_array;
  *    must be plain serializable DTOs (no closures / resources).
  *
  * Workflow resolution goes through a {@see Registry} (Symfony's
- * {@see \Symfony\Component\Workflow\Registry}) populated at boot time by
+ * {@see Registry}) populated at boot time by
  * the application. Each registered workflow is paired with an
  * {@see \Symfony\Component\Workflow\SupportStrategy\InstanceOfSupportStrategy}
  * that matches the saga's subject class, so `$registry->get($subject)`
@@ -72,6 +73,13 @@ final readonly class SagaRunner
      * history column the row already has needs no schema change.
      */
     public const ROLLBACK_FAILED = '!saga:rollback-failed';
+
+    /**
+     * Where {@see signal()} puts the payload in Symfony's apply context, so the
+     * signal's own transition listener can read it with
+     * `$event->getContext()[SagaRunner::SIGNAL_CONTEXT_KEY]`.
+     */
+    public const SIGNAL_CONTEXT_KEY = 'saga.signal';
 
     public function __construct(
         private SagaStateRepository      $repository,
@@ -120,19 +128,17 @@ final readonly class SagaRunner
 
         $this->assertTransitionNamesAreUnique($workflow, $saga);
 
-        $enabled = $this->enabled($workflow, $subject);
+        $enabledTransitions = $workflow->getEnabledTransitions($subject);
+        $enabled = $this->namesOf($this->withoutSignals($enabledTransitions));
 
-        // Same three-way classification run() uses. An initial marking with
-        // nothing enabled is only an error when nothing *could* ever fire;
-        // otherwise the saga legitimately starts parked behind a guard —
-        // "created, awaiting approval" is a canonical saga shape.
-        if ($enabled === [] && !$this->hasOutgoingTransitions($workflow, $marking)) {
-            throw new SagaException(\sprintf(
-                "Saga '%s' (%s) cannot start: its initial marking has no outgoing transitions at all, "
-                . 'so nothing can ever fire. This is a definition bug.',
-                $sagaId,
-                $saga::class,
-            ));
+        // A saga may legitimately start PARKED — its way out is a Signal, or a
+        // guard is holding it — so an empty dispatch list is not by itself an
+        // error. It is only an error when nothing could EVER fire from here.
+        if ($enabledTransitions === [] && !$this->hasOutgoingTransitions($workflow, $marking)) {
+            $sagaClass = $saga::class;
+
+            throw new SagaException("Saga '$sagaId' ($sagaClass) cannot start: its initial marking has no outgoing transitions at all, "
+                . 'so nothing can ever fire. This is a definition bug.');
         }
 
         $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, version: 1);
@@ -194,82 +200,193 @@ final readonly class SagaRunner
      */
     public function run(Saga $saga, string $sagaId, string $transition): void
     {
-        /** @var list<string> $dispatch */
-        $dispatch = $this->lock->withLock(
+        /** @var array{bool, list<string>} $result */
+        $result = $this->lock->withLock(
             $sagaId,
-            fn(): array => $this->runExclusively($saga, $sagaId, $transition),
+            fn(): array => $this->advanceExclusively($saga, $sagaId, $transition),
         );
 
+        [, $dispatch] = $result;
         $this->dispatch($saga, $sagaId, $dispatch);
     }
 
-    /** @return list<string> transitions to enqueue once the lock is released */
-    private function runExclusively(Saga $saga, string $sagaId, string $transition): array
+    /**
+     * Fires the {@see Signal} that accepts $payload, unparking the saga.
+     *
+     * A parked saga is one whose only enabled transitions are Signals, which the
+     * runner never queues by itself. This is the way in. The payload reaches the
+     * signal's transition listener as Symfony's apply context, under
+     * {@see SIGNAL_CONTEXT_KEY} — the same channel Symfony uses for per-apply
+     * data — and that listener is where it gets folded into the subject if it
+     * needs to outlive the step.
+     *
+     * The signal is matched from the marking alone: of the Signals currently
+     * enabled, exactly one must accept the payload. Zero is an error naming what
+     * the saga is actually waiting for, and more than one is an ambiguous
+     * definition. Neither is silently guessed at.
+     *
+     * Runs under the same {@see SagaLock} and the same optimistic-lock save as
+     * every other write, so two simultaneous signals end with one applied.
+     *
+     * A saga that no longer exists is not an error — a signal may legitimately
+     * arrive late.
+     *
+     * @throws SagaException when nothing enabled accepts the payload, when more
+     *                       than one Signal does, or when the rollback is
+     *                       incomplete
+     */
+    public function signal(Saga $saga, string $sagaId, object $payload): SignalOutcome
+    {
+        /** @var array{SignalOutcome, list<string>} $result */
+        $result = $this->lock->withLock(
+            $sagaId,
+            fn(): array => $this->signalExclusively($saga, $sagaId, $payload),
+        );
+
+        [$outcome, $dispatch] = $result;
+        $this->dispatch($saga, $sagaId, $dispatch);
+
+        return $outcome;
+    }
+
+    /** @return array{SignalOutcome, list<string>} */
+    private function signalExclusively(Saga $saga, string $sagaId, object $payload): array
     {
         $state = $this->repository->load($sagaId);
         if ($state === null) {
-            // Race: saga was already completed/canceled by a concurrent
-            // step. Nothing to do — silently skip rather than throw, since
-            // signal-driven `run()` from external callers (webhooks, etc.)
-            // may legitimately race with the forward path.
-            return [];
+            return [SignalOutcome::NotFound, []];
         }
 
-        if ($state->marking === []) {
-            // Symfony would treat this as "subject not in the workflow yet" and
-            // re-seed the initial places, silently restarting the saga and
-            // re-running its first action. The library never persists an empty
-            // marking, so this is always corruption.
-            throw new SagaException(\sprintf(
-                "Saga '%s' has an empty marking, which the runner never writes — the row is corrupt.",
-                $sagaId,
-            ));
+        $this->assertRollbackIsNotIncomplete($state, $sagaId);
+        $this->assertMarkingIsNotEmpty($state, $sagaId);
+
+        $subject = $state->subject;
+        $workflow = $this->workflowFor($saga, $subject, $sagaId);
+        $this->assertMarkingStillFits($workflow, $state, $sagaId);
+
+        $this->markingStore->setMarking($subject, new Marking($state->marking));
+
+        $matching = array_values(array_filter(
+            $this->enabledSignals($workflow, $subject),
+            static fn(Signal $signal): bool => $signal->accepts($payload),
+        ));
+
+        if ($matching === []) {
+            $awaited = array_map(
+                static fn(Signal $signal): string => $signal->getName().' awaits '.$signal->awaits,
+                $this->enabledSignals($workflow, $subject),
+            );
+            $payloadClass = $payload::class;
+
+            throw new SagaException("Saga '$sagaId' is not waiting for a $payloadClass. "
+                . ($awaited === []
+                    ? 'It has no signal enabled at all — it is either moving or stalled, not parked.'
+                    : 'Enabled signals: '.implode('; ', $awaited).'.'));
         }
 
-        if (in_array(self::ROLLBACK_FAILED, $state->history, true)) {
-            throw new SagaException(\sprintf(
-                "Saga '%s' has an incomplete rollback and will not be advanced. Its history records "
-                . 'a compensation that threw; the row was kept so the rollback can be retried, and '
-                . 'moving it forward would re-run steps that have already been undone.',
-                $sagaId,
-            ));
+        if (count($matching) > 1) {
+            $names = implode(', ', array_map(static fn(Signal $s): string => $s->getName(), $matching));
+            $payloadClass = $payload::class;
+
+            throw new SagaException("Saga '$sagaId' has more than one signal accepting a $payloadClass "
+                . "($names). Narrow their awaited types, or guard all but one of them.");
         }
+
+        // From here it is an ordinary apply, with the payload riding Symfony's
+        // own context channel.
+        [, $dispatch] = $this->applyAndPersist(
+            $sagaId,
+            $state,
+            $workflow,
+            $subject,
+            $matching[0]->getName(),
+            [self::SIGNAL_CONTEXT_KEY => $payload],
+        );
+
+        return [SignalOutcome::Applied, $dispatch];
+    }
+
+    /**
+     * The Signals currently fireable — what the saga is parked on.
+     *
+     * @return list<Signal>
+     */
+    private function enabledSignals(WorkflowInterface $workflow, object $subject): array
+    {
+        return array_values(array_filter(
+            $workflow->getEnabledTransitions($subject),
+            static fn(Transition $t): bool => $t instanceof Signal,
+        ));
+    }
+
+    /** @return array{bool, list<string>} whether the transition applied, and what to enqueue */
+    private function advanceExclusively(Saga $saga, string $sagaId, string $transition): array
+    {
+        $state = $this->repository->load($sagaId);
+        if ($state === null) {
+            // Race: saga was already completed/canceled by a concurrent step.
+            // Nothing to do — silently skip rather than throw, since a signal
+            // from outside may legitimately race with the forward path.
+            return [false, []];
+        }
+
+        $this->assertRollbackIsNotIncomplete($state, $sagaId);
+        $this->assertMarkingIsNotEmpty($state, $sagaId);
 
         $subject = $state->subject;
         $workflow = $this->workflowFor($saga, $subject, $sagaId);
 
-        $this->assertDefinitionStillFits($workflow, $state, $sagaId, $transition);
+        $this->assertMarkingStillFits($workflow, $state, $sagaId);
+        $this->assertTransitionStillExists($workflow, $sagaId, $transition);
+        $this->assertNotASignal($workflow, $sagaId, $transition);
 
-        // Marking's constructor takes place => token count, so the counts
-        // survive the round trip instead of collapsing to one token each.
-        $marking = new Marking($state->marking);
-        $this->markingStore->setMarking($subject, $marking);
+        // Marking's constructor takes place => token count, so the counts survive
+        // the round trip instead of collapsing to one token each.
+        $this->markingStore->setMarking($subject, new Marking($state->marking));
 
-        // Duplicate guard. Reached under the saga lock, so the marking was
-        // read exclusively: a job redelivered after this transition was
-        // already consumed genuinely finds it no longer fireable, rather than
-        // racing a concurrent worker into the same apply().
+        // Duplicate guard. Reached under the saga lock, so the marking was read
+        // exclusively: a job redelivered after this transition was already
+        // consumed genuinely finds it no longer fireable, rather than racing a
+        // concurrent worker into the same apply().
         if (!$workflow->can($subject, $transition)) {
-            return [];
+            return [false, []];
         }
 
-        $workflow->apply($subject, $transition);
+        return $this->applyAndPersist($sagaId, $state, $workflow, $subject, $transition, []);
+    }
+
+    /**
+     * Applies one transition and persists the result, returning what to queue.
+     *
+     * Shared by {@see run()} and {@see signal()}, so a signal goes through exactly
+     * the same optimistic-lock save, terminal cleanup and fan-out as any other
+     * step. The only difference is the apply context.
+     *
+     * @param  array<string, mixed>  $context  Symfony's per-apply context
+     * @return array{bool, list<string>}
+     */
+    private function applyAndPersist(
+        string $sagaId,
+        SagaState $state,
+        WorkflowInterface $workflow,
+        object $subject,
+        string $transition,
+        array $context,
+    ): array {
+        $workflow->apply($subject, $transition, $context);
 
         $newMarking = $this->markingStore->getMarking($subject);
         $history = [...$state->history, $transition];
-        $enabled = $this->enabled($workflow, $subject);
+        $enabled = $workflow->getEnabledTransitions($subject);
 
-        // Terminal: no enabled transitions and no outgoing ones from the
-        // new marking. The saga has reached a place that structurally
-        // accepts no further moves — clean up and exit.
-        if (empty($enabled) && !$this->hasOutgoingTransitions($workflow, $newMarking)) {
+        // Terminal: nothing enabled and nothing structurally outgoing. The saga
+        // reached a place that accepts no further moves — clean up and exit.
+        if ($enabled === [] && !$this->hasOutgoingTransitions($workflow, $newMarking)) {
             $this->repository->delete($sagaId);
 
-            return [];
+            return [true, []];
         }
 
-        // The saga is alive — either advancing or waiting on a guard-blocked
-        // external state. Persist the new marking so it can be resumed.
         $this->repository->save(new SagaState(
             $state->id,
             $this->markingToArray($newMarking),
@@ -278,19 +395,74 @@ final readonly class SagaRunner
             $state->version + 1,
         ));
 
-        // Queue everything fireable. Siblings of a fork that are already in
-        // flight get queued a second time, and that is deliberate: correctness
-        // comes from the saga lock plus the can() check above, which together
-        // reduce a duplicate to a job that takes the lock, finds its transition
-        // consumed and returns. Tracking what had been dispatched would save
-        // those jobs — an n-way fork costs O(n^2) pushes rather than O(n) — but
-        // it would need persisted state to do it, and it would buy efficiency
-        // rather than correctness.
+        // Signals are excluded, and that exclusion IS the parking mechanism: a
+        // saga whose only fireable transitions are Signals has nothing queued
+        // against it and waits for signal() to be called from outside. Nothing is
+        // persisted to express that — it is derived from the definition and the
+        // marking.
         //
-        // An empty result is the wait state: alive, nothing fireable, so an
-        // external caller will signal run() once a guard passes.
-        return $enabled;
+        // Everything else fireable is queued, including siblings of a fork that
+        // are already in flight. Correctness comes from the saga lock plus the
+        // can() check, which reduce a duplicate to a job that takes the lock,
+        // finds its transition consumed and returns. Suppressing them would need
+        // the dispatched set persisted, and would buy job count, not correctness.
+        return [true, $this->namesOf($this->withoutSignals($enabled))];
     }
+
+    /**
+     * @param  array<Transition>  $transitions
+     * @return list<Transition>
+     */
+    private function withoutSignals(array $transitions): array
+    {
+        return array_values(array_filter(
+            $transitions,
+            static fn(Transition $t): bool => !$t instanceof Signal,
+        ));
+    }
+
+    /**
+     * @param  array<Transition>  $transitions
+     * @return list<string>
+     */
+    private function namesOf(array $transitions): array
+    {
+        return array_values(array_unique(array_map(
+            static fn(Transition $t): string => $t->getName(),
+            $transitions,
+        )));
+    }
+
+    /**
+     * A Signal may only be fired through {@see signal()}.
+     *
+     * Firing one through run() would skip the payload entirely, so the listener
+     * that folds the signal's data in would see an empty context — the saga would
+     * advance past its own wait with nothing to show for it.
+     */
+    private function assertNotASignal(WorkflowInterface $workflow, string $sagaId, string $transition): void
+    {
+        foreach ($workflow->getDefinition()->getTransitions() as $candidate) {
+            if ($candidate->getName() === $transition && $candidate instanceof Signal) {
+                // Drift rather than a plain error: a deploy that turns an existing
+                // transition into a Signal leaves queued jobs for it, and those
+                // must not be mistaken for business failures and compensated.
+                throw SagaDefinitionDriftException::firedSignalDirectly($sagaId, $transition);
+            }
+        }
+    }
+
+    private function assertMarkingIsNotEmpty(SagaState $state, string $sagaId): void
+    {
+        if ($state->marking === []) {
+            // Symfony would treat this as "subject not in the workflow yet" and
+            // re-seed the initial places, silently restarting the saga and
+            // re-running its first action. The library never persists an empty
+            // marking, so this is always corruption.
+            throw new SagaException("Saga '$sagaId' has an empty marking, which the runner never writes — the row is corrupt.");
+        }
+    }
+
 
     /**
      * Rolls the saga back and, if every compensation succeeded, deletes it.
@@ -416,25 +588,34 @@ final readonly class SagaRunner
      * push and made a two-branch fork grow 2^L rather than linearly. Doing it on
      * request keeps the hot path linear.
      *
+     * Not to be confused with {@see signal()}, which is how a PARKED saga is
+     * unblocked. This one only re-queues work that is already fireable, and it
+     * excludes Signals for the same reason every other path does — they are
+     * fired from outside, never by the runner.
+     *
      * Safe to call on a healthy saga: a step still genuinely queued simply
      * arrives twice, and the saga lock plus the can() check reduce the duplicate
      * to an immediate return.
      *
      * @return list<string> the transitions re-queued
      */
-    public function resume(Saga $saga, string $sagaId): array
+    public function requeue(Saga $saga, string $sagaId): array
     {
         /** @var list<string> $dispatch */
         $dispatch = $this->lock->withLock($sagaId, function () use ($saga, $sagaId): array {
             $state = $this->repository->load($sagaId);
             if ($state === null || in_array(self::ROLLBACK_FAILED, $state->history, true)) {
+                // Silent rather than throwing: requeue() is a recovery sweep and
+                // must be safe to run over a whole table.
                 return [];
             }
 
             $subject = $state->subject;
             $this->markingStore->setMarking($subject, new Marking($state->marking));
 
-            return $this->enabled($this->workflowFor($saga, $subject, $sagaId), $subject);
+            $workflow = $this->workflowFor($saga, $subject, $sagaId);
+
+            return $this->namesOf($this->withoutSignals($workflow->getEnabledTransitions($subject)));
         });
 
         $this->dispatch($saga, $sagaId, $dispatch);
@@ -455,27 +636,51 @@ final readonly class SagaRunner
      * reported as {@see SagaDefinitionDriftException} so the queue layer can
      * park the saga instead of rolling it back.
      */
-    private function assertDefinitionStillFits(
-        WorkflowInterface $workflow,
-        SagaState $state,
-        string $sagaId,
-        string $transition,
-    ): void {
-        $definition = $workflow->getDefinition();
+    private function assertMarkingStillFits(WorkflowInterface $workflow, SagaState $state, string $sagaId): void
+    {
+        $places = array_values($workflow->getDefinition()->getPlaces());
 
-        $places = array_values($definition->getPlaces());
         foreach (array_keys($state->marking) as $place) {
             if (!in_array($place, $places, true)) {
                 throw SagaDefinitionDriftException::unknownPlace($sagaId, (string) $place, $places);
             }
         }
+    }
 
+    /**
+     * A renamed transition is worse than a renamed place, because `can()` merely
+     * returns false for a name it does not know — which made every redelivered
+     * job and every external signal a permanent, invisible no-op.
+     */
+    private function assertTransitionStillExists(
+        WorkflowInterface $workflow,
+        string $sagaId,
+        string $transition,
+    ): void {
         $names = array_values(array_unique(array_map(
             static fn(Transition $t): string => $t->getName(),
-            $definition->getTransitions(),
+            $workflow->getDefinition()->getTransitions(),
         )));
+
         if (!in_array($transition, $names, true)) {
             throw SagaDefinitionDriftException::unknownTransition($sagaId, $transition, $names);
+        }
+    }
+
+    /**
+     * Refuses to touch a saga whose rollback did not complete.
+     *
+     * The row survives a failed compensation because it is the only record of
+     * what is still un-undone, but it otherwise looks like a live saga — so a
+     * leftover job, or a late signal, would move it forward and re-run steps that
+     * have already been undone.
+     */
+    private function assertRollbackIsNotIncomplete(SagaState $state, string $sagaId): void
+    {
+        if (in_array(self::ROLLBACK_FAILED, $state->history, true)) {
+            throw new SagaException("Saga '$sagaId' has an incomplete rollback and will not be advanced. Its history records "
+                . 'a compensation that threw; the row was kept so the rollback can be retried, and '
+                . 'moving it forward would re-run steps that have already been undone.');
         }
     }
 
@@ -490,25 +695,19 @@ final readonly class SagaRunner
      */
     private function assertTransitionNamesAreUnique(WorkflowInterface $workflow, Saga $saga): void
     {
+        $sagaClass = $saga::class;
         $seen = [];
+
         foreach ($workflow->getDefinition()->getTransitions() as $transition) {
             $name = $transition->getName();
-            if (\str_starts_with($name, '!saga:')) {
-                throw new SagaException(\sprintf(
-                    "Saga %s declares a transition named '%s'. The '!saga:' prefix is reserved for the "
-                    . 'markers the runner journals into history.',
-                    $saga::class,
-                    $name,
-                ));
+            if (str_starts_with($name, '!saga:')) {
+                throw new SagaException("Saga $sagaClass declares a transition named '$name'. The '!saga:' prefix is reserved for the "
+                    . 'markers the runner journals into history.');
             }
             if (isset($seen[$name])) {
-                throw new SagaException(\sprintf(
-                    "Saga %s declares transition name '%s' more than once. Symfony applies every matching "
+                throw new SagaException("Saga $sagaClass declares transition name '$name' more than once. Symfony applies every matching "
                     . 'transition, so the action would run once per arc while compensation could only undo it '
-                    . 'once. Give each arc a distinct name.',
-                    $saga::class,
-                    $name,
-                ));
+                    . 'once. Give each arc a distinct name.');
             }
             $seen[$name] = true;
         }
@@ -533,33 +732,13 @@ final readonly class SagaRunner
         try {
             return $this->workflows->get($subject, $saga::class);
         } catch (WorkflowInvalidArgumentException $e) {
-            throw new SagaException(\sprintf(
-                "No workflow is registered for saga '%s' (%s) over subject %s. The Symfony Workflow must be "
-                . 'constructed with the saga FQCN as its $name — that argument is optional in Symfony, and '
-                . "omitting it makes every 'workflow.<FQCN>.*' listener silently dead. Registry said: %s",
-                $sagaId,
-                $saga::class,
-                $subject::class,
-                $e->getMessage(),
-            ), 0, $e);
-        }
-    }
+            $sagaClass = $saga::class;
+            $subjectClass = $subject::class;
 
-    /**
-     * Transition names currently fireable, deduplicated.
-     *
-     * array_values() must stay OUTERMOST: array_unique() preserves keys, so
-     * wrapping it the other way round leaves gaps and the result is no longer a
-     * list, which the return type promises.
-     *
-     * @return list<string>
-     */
-    private function enabled(WorkflowInterface $workflow, object $subject): array
-    {
-        return array_values(array_unique(array_map(
-            static fn(Transition $transition): string => $transition->getName(),
-            $workflow->getEnabledTransitions($subject),
-        )));
+            throw new SagaException("No workflow is registered for saga '$sagaId' ($sagaClass) over subject $subjectClass. The Symfony Workflow must be "
+                . 'constructed with the saga FQCN as its $name — that argument is optional in Symfony, and '
+                . "omitting it makes every 'workflow.<FQCN>.*' listener silently dead. Registry said: {$e->getMessage()}", 0, $e);
+        }
     }
 
     /**

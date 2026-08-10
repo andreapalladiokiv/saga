@@ -16,8 +16,9 @@ use function sprintf;
  * queued job and every external signal for it a permanent no-op. Neither is a
  * business failure and neither should be compensated: rolling back is exactly
  * the wrong response to "the code changed under this saga", and it is
- * irreversible. Callers should PARK the saga instead
- * ({@see SagaRunner::park()}) and let a human decide.
+ * irreversible. {@see \Techork\Saga\Laravel\SagaStepJob::failed()} therefore
+ * declines to compensate on this, logs it at `critical` and leaves the saga
+ * exactly where it is for a human to decide.
  */
 final class SagaDefinitionDriftException extends SagaException
 {
@@ -30,6 +31,19 @@ final class SagaDefinitionDriftException extends SagaException
             $sagaId,
             $place,
             implode(', ', $knownPlaces),
+        ));
+    }
+
+    public static function firedSignalDirectly(string $sagaId, string $transition): self
+    {
+        return new self(sprintf(
+            "Transition '%s' of saga '%s' is a %s and can only be fired by SagaRunner::signal(), which "
+            . 'carries its payload. Calling run() on it would advance the saga past its own wait with no '
+            . 'data — which is what a queued job left over from before this transition became a Signal '
+            . 'would do.',
+            $transition,
+            $sagaId,
+            Signal::class,
         ));
     }
 

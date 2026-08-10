@@ -104,11 +104,60 @@ $runner->start(new OrderSaga, $order->id, new OrderSubject($order->id));
 
 That persists the state and queues the first step. Everything after that is queue-driven. A saga whose first transition is guard-blocked starts parked in a wait state — `start()` only rejects an initial marking with no outgoing transitions at all, which is a definition bug.
 
-To resume a saga waiting on the outside world:
+### Waiting, and signalling
+
+A wait is an edge in the graph. `Signal` is a `Transition` the runner never fires by itself, and that one rule is the whole mechanism:
 
 ```php
-$runner->run(new OrderSaga, $sagaId, 'payment_confirmed');
+new Definition(
+    ['created', 'awaiting_payment', 'captured', 'settled', 'expired'],
+    [
+        new Transition('publish', 'created', 'awaiting_payment'),
+        new Signal('payment_received', 'awaiting_payment', 'captured', awaits: PaymentReceived::class),
+        new Transition('expire', 'awaiting_payment', 'expired'),
+        new Transition('settle', 'captured', 'settled'),
+    ],
+    ['created'],
+);
 ```
+
+Because it extends `Transition`, Symfony's own dumpers render it — the wait shows up in your Graphviz/PlantUML/Mermaid diagram like any other edge, and its guards are the ordinary `workflow.<FQCN>.guard.<name>` listeners. A signals list declared beside the definition would be invisible to both.
+
+Three states follow, all derived from the definition and the marking with nothing extra persisted:
+
+| State | How it is determined |
+| --- | --- |
+| moving | something enabled is not a `Signal` — that is what gets queued |
+| **parked** | everything enabled is a `Signal` — nothing is queued, the saga waits |
+| **stalled** | nothing is enabled at all — a real anomaly, not the normal shape of waiting |
+
+**Firing it.** Only from outside, with a payload:
+
+```php
+$outcome = $runner->signal($saga, $link->id, new PaymentReceived(
+    card: $request->cardMask(), address: $request->billingAddress(),
+));
+```
+
+Of the Signals currently enabled, exactly one must `accepts()` the payload. Zero raises an error naming what the saga is actually waiting for; more than one is an ambiguous definition. `run()` on a Signal is refused outright — it would advance the saga past its own wait with no data. `SignalOutcome` is `Applied` or `NotFound`; a late signal for a finished saga is not an error.
+
+**Handling it.** A signal's listener is an ordinary transition listener. The only difference is that the payload is in the apply context:
+
+```php
+Event::listen('workflow.'.CheckoutSaga::class.'.transition.payment_received',
+    function (TransitionEvent $event): void {
+        $payment = Signal::payload($event, PaymentReceived::class);   // typed and checked
+
+        $subject = $event->getSubject();
+        $subject->card = $payment->card;        // ← this is what makes it durable
+    });
+```
+
+`Signal::payload()` exists so you do not index `array<mixed>` by a string key: it narrows the type for static analysis and fails with a clear message if the transition was fired by `run()`, or signalled with something else.
+
+**The payload does not travel past its own apply.** Symfony's context is per-apply and is never persisted. Every event of that apply can read it — `transition`, `leave`, `enter`, `entered`, `completed`, and `announce.<next>`, which is useful if you only need the data to decide something about the next step. But the next transition runs later, on a worker, with an empty context. **So the listener must fold whatever has to survive into the subject** — which also means the subject has to be mutable, and cannot be replaced.
+
+**A mixed exit needs no extra concept, but its ordinary transition must be guarded.** `expire` leaves the same place and is not a `Signal`, so the runner queues it — and if nothing blocks it, it fires immediately and the saga never parks at all. Guard it on the deadline, and wake it with `requeue($saga, $sagaId)` from a scheduled sweep.
 
 ---
 
@@ -167,7 +216,7 @@ Two durations answer different questions, and they are coupled:
 
 **A failed rollback parks the saga, and unparking it is manual.** `compensateAndDelete()` does not delete when a compensation throws — the row holds the subject and history needed to retry it — and appends `SagaRunner::ROLLBACK_FAILED` to `history` so nothing advances it afterwards. `run()` and `resume()` both refuse. The signal is `SagaFailedException`, logged at `critical` and rethrown by the job; there is no query to list such rows.
 
-**Definition drift is reported, not handled.** Renaming a place or a transition raises `SagaDefinitionDriftException` instead of compensating, because rolling back is the wrong and irreversible response to a code change. The job fails and lands in `failed_jobs`; deciding what to do is manual.
+**Definition drift is reported, not handled.** Renaming a place or a transition raises `SagaDefinitionDriftException`, and the job declines to compensate on it — rolling back is the wrong and irreversible response to a code change, since one renamed place would mean a refund for every saga parked in it. It is logged at `critical` and lands in `failed_jobs`; deciding what to do is manual, and there is no query to list the affected sagas.
 
 **There is no way to enumerate stuck sagas.** Recovery exists — `$runner->resume($saga, $sagaId)` re-queues whatever the saga can currently fire, which is the fix for a hand-off lost between the save and the push — but finding the ids to call it with is on you. Doing it automatically on every replayed job was tried and reverted: it turned each duplicate into another push and made a two-branch fork grow 2^L.
 
@@ -185,7 +234,7 @@ Subject DTOs: add properties with defaults, never rename or move the class. Dese
 | --- | --- |
 | `SagaException` | Base. Operational problems the library detects itself |
 | `SagaConcurrencyException` | Another worker holds or advanced the saga. **Retry; never compensate** |
-| `SagaDefinitionDriftException` | The code no longer fits this saga. Investigate by hand |
+| `SagaDefinitionDriftException` | The code no longer fits this saga — a renamed place or transition, or a transition that became a `Signal`. **Never compensated**: rolling back is an irreversible response to a deploy. Logged at `critical` and left where it is |
 | `SagaAlreadyExistsException` | `start()` called twice for one id — treat as "already running" |
 | `SagaFailedException` | A rollback failed and is incomplete. Carries `$cause` and `$compensationErrors` |
 

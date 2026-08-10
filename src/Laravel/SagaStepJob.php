@@ -13,6 +13,7 @@ use Illuminate\Queue\SerializesModels;
 use Psr\Log\LoggerInterface;
 use Techork\Saga\Saga;
 use Techork\Saga\SagaConcurrencyException;
+use Techork\Saga\SagaDefinitionDriftException;
 use Techork\Saga\SagaFailedException;
 use Techork\Saga\SagaRunner;
 use Throwable;
@@ -31,15 +32,18 @@ use Throwable;
  *  - `tries(string $transition): int`     — max attempts (0 = unlimited)
  *  - `backoff(string $transition): array` — delay between attempts in seconds
  *
- * Those govern BUSINESS failures only. A {@see SagaConcurrencyException} means
- * the step's persist lost a race with another worker; that is an
- * infrastructure conflict, and it is handled on a separate budget
- * ({@see $concurrencyAttempt}) so a contended saga cannot burn through the
- * retry allowance its author reserved for real errors — and, above all, so it
- * can never reach {@see failed()} and be compensated.
+ * Those govern BUSINESS failures only, and {@see failed()} compensates only for
+ * those. Two other kinds of failure reach it and must NOT be rolled back:
  *
- * When retries for a genuine failure are exhausted, {@see failed()} triggers
- * compensation via {@see SagaRunner::compensateAndDelete()}.
+ *  - {@see SagaConcurrencyException} — the step's persist lost a race. Handled on
+ *    a separate budget ({@see $concurrencyAttempt}) so a contended saga cannot
+ *    burn through the retry allowance its author reserved for real errors, and so
+ *    it can never reach failed() at all in the normal case.
+ *  - {@see SagaDefinitionDriftException} — the code no longer fits this saga
+ *    because a place or a transition was renamed, or a transition became a
+ *    {@see \Techork\Saga\Signal}. Compensating would be an irreversible
+ *    response to a deploy: one renamed place would mean a refund for every saga
+ *    parked in it.
  *
  * @see https://laravel.com/docs/queues#max-job-attempts-and-timeout
  */
@@ -179,12 +183,15 @@ final class SagaStepJob implements ShouldQueue
      * Rolls the saga back — this transition first, then every applied one in
      * reverse — and deletes the state only if every compensation succeeded.
      *
+     * Compensation is skipped entirely for a lost race and for definition drift —
+     * see the class docblock for why neither is a business failure.
+     *
      * A rollback that itself fails is the most dangerous outcome a saga has, so
-     * it is never swallowed: the errors are logged at `critical` and rethrown
-     * as {@see SagaFailedException}, which carries both the original cause and
-     * the compensation failures. The saga row survives so the rollback can be
-     * retried — nothing marks it as needing attention, so these log lines and
-     * the failed_jobs entry are the only signal an operator gets.
+     * it is never swallowed: the errors are logged at `critical` and rethrown as
+     * {@see SagaFailedException}, which carries both the original cause and the
+     * compensation failures. The saga row survives so the rollback can be
+     * retried — nothing marks it as needing attention, so these log lines and the
+     * failed_jobs entry are the only signal an operator gets.
      */
     public function failed(Throwable $exception): void
     {
@@ -193,6 +200,17 @@ final class SagaStepJob implements ShouldQueue
             // compensating here would roll back their work while this worker's
             // own side effect — never recorded in history — stays uncompensated.
             // The job is already recorded in failed_jobs for an operator to see.
+            return;
+        }
+
+        if ($exception instanceof SagaDefinitionDriftException) {
+            // The code no longer fits this saga: a place or a transition was
+            // renamed, or an existing transition became a Signal. Rolling back is
+            // the wrong and irreversible response to a deploy — a one-word rename
+            // would mean a refund for every saga parked in that place. Leave the
+            // saga alone and make it loud instead.
+            $this->logNeedsAttention($exception);
+
             return;
         }
 
@@ -224,8 +242,27 @@ final class SagaStepJob implements ShouldQueue
         );
     }
 
+    private function logNeedsAttention(SagaDefinitionDriftException $e): void
+    {
+        $this->log('Saga needs attention: the definition no longer fits it', $e);
+    }
+
     /** @param Throwable[] $errors */
     private function logCompensationFailures(array $errors): void
+    {
+        foreach ($errors as $error) {
+            $this->log('Saga compensation failed', $error);
+        }
+    }
+
+    /**
+     * Logs at `critical` when a logger is bound.
+     *
+     * Both cases this serves — a rollback that failed, and a saga the code no
+     * longer fits — are deliberately NOT compensated, so the log line and the
+     * failed_jobs row are the only signal an operator gets.
+     */
+    private function log(string $message, Throwable $cause): void
     {
         $container = $this->container();
         if (! $container->bound(LoggerInterface::class)) {
@@ -235,14 +272,12 @@ final class SagaStepJob implements ShouldQueue
         /** @var LoggerInterface $logger */
         $logger = $container->make(LoggerInterface::class);
 
-        foreach ($errors as $error) {
-            $logger->critical('Saga compensation failed', [
-                'saga' => $this->sagaClass,
-                'saga_id' => $this->sagaId,
-                'failed_transition' => $this->transition,
-                'exception' => $error,
-            ]);
-        }
+        $logger->critical($message, [
+            'saga' => $this->sagaClass,
+            'saga_id' => $this->sagaId,
+            'transition' => $this->transition,
+            'exception' => $cause,
+        ]);
     }
 
     public function displayName(): string

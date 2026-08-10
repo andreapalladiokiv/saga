@@ -447,7 +447,7 @@ final class SagaRunnerTest extends TestCase
         }
 
         self::assertSame(0, $charges, 'the action must not run after a failed rollback');
-        self::assertSame([], $this->runner->resume($saga, 'stuck-1'), 'resume must not revive it either');
+        self::assertSame([], $this->runner->requeue($saga, 'stuck-1'), 'requeue must not revive it either');
     }
 
     public function testAReservedTransitionNameIsRejected(): void
@@ -526,7 +526,7 @@ final class SagaRunnerTest extends TestCase
         self::assertSame(1, $charges, 'the lock serialises them and can() rejects the replay');
     }
 
-    public function testResumeRequeuesWhatIsFireableAfterALostHandOff(): void
+    public function testRequeuePushesWhatIsFireableAfterALostHandOff(): void
     {
         // run() persists and then pushes, two steps with nothing tying them
         // together. If the push is lost the saga is alive with nothing in flight.
@@ -551,7 +551,7 @@ final class SagaRunnerTest extends TestCase
         $this->runner->run($saga, 'heal-1', 't1');
         self::assertTrue($this->queue->isEmpty(), 'a replay must not manufacture pushes');
 
-        self::assertSame(['t2'], $this->runner->resume($saga, 'heal-1'));
+        self::assertSame(['t2'], $this->runner->requeue($saga, 'heal-1'));
         self::assertSame(['t2'], $this->queue->transitions());
     }
 
