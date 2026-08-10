@@ -1,0 +1,28 @@
+# Tests are analysed too, but a level lower. They implement framework contracts
+# whose own signatures carry no generics, and they poke at fixtures through the
+# deliberately-opaque `object` subject type; chasing those would add noise
+# without protecting the library.
+parameters:
+    level: 5
+    paths:
+        - tests
+    ignoreErrors:
+        # Recorded by a test double, asserted through a by-reference capture.
+        -
+            identifier: property.onlyWritten
+        # Fixtures pin one concrete routing value; the interface allows null.
+        -
+            identifier: return.unusedType
+        # Illuminate's own contracts are narrower than the classes bound for
+        # them: ServiceProvider::$app is annotated Foundation\Application and
+        # getSchemaBuilder() is missing from ConnectionInterface. A bare
+        # container is still the right thing to test the provider against.
+        -
+            identifier: argument.type
+            path: tests/Laravel/SagaServiceProviderTest.php
+        -
+            identifier: argument.type
+            path: tests/Laravel/DatabaseSagaStateRepositoryTest.php
+        -
+            identifier: method.notFound
+            path: tests/Laravel/DatabaseSagaStateRepositoryTest.php

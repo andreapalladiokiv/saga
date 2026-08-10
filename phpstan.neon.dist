@@ -1,0 +1,10 @@
+# The shipped library is held to the strictest level: it is what consumers get,
+# and its annotations are load-bearing (list<string>, class-string<Saga>,
+# array<string, int<1, max>>). Nothing verified them before, and level 8
+# immediately found a real one — array_values() had drifted inside
+# array_unique() in SagaRunner::enabled(), so the declared list<string> was not
+# a list.
+parameters:
+    level: 8
+    paths:
+        - src

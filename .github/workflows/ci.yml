@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  tests:
+    name: PHP ${{ matrix.php }} · Workflow ${{ matrix.workflow }} · Laravel ${{ matrix.laravel }} · ${{ matrix.deps }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The matrix is the point. Every version-specific defect this package has
+        # had was invisible on a single pinned resolution: a PHP 8.4-only
+        # function under a ">=8.2" constraint, a Carbon 2 method that does not
+        # exist, an illuminate/cache method that reaches for a helper only
+        # laravel/framework ships. One lane cannot see any of them.
+        include:
+          - { php: '8.2', workflow: '^7.0', laravel: '^11.0', deps: prefer-lowest }
+          - { php: '8.2', workflow: '^7.0', laravel: '^11.0', deps: prefer-stable }
+          - { php: '8.3', workflow: '^7.0', laravel: '^11.0', deps: prefer-stable }
+          - { php: '8.3', workflow: '^7.0', laravel: '^12.0', deps: prefer-stable }
+          - { php: '8.4', workflow: '^8.0', laravel: '^12.0', deps: prefer-stable }
+          - { php: '8.4', workflow: '^8.0', laravel: '^13.0', deps: prefer-stable }
+          - { php: '8.5', workflow: '^8.0', laravel: '^13.0', deps: prefer-stable }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_sqlite
+          coverage: none
+
+      - name: Pin the lane's dependencies
+        run: |
+          composer require --no-update --dev \
+            "symfony/workflow:${{ matrix.workflow }}" \
+            "illuminate/contracts:${{ matrix.laravel }}" \
+            "illuminate/support:${{ matrix.laravel }}" \
+            "illuminate/bus:${{ matrix.laravel }}" \
+            "illuminate/cache:${{ matrix.laravel }}" \
+            "illuminate/database:${{ matrix.laravel }}" \
+            "illuminate/events:${{ matrix.laravel }}" \
+            "illuminate/queue:${{ matrix.laravel }}"
+          composer config platform.php ${{ matrix.php }}
+
+      - name: Install
+        run: composer update --${{ matrix.deps }} --prefer-dist --no-interaction
+
+      - name: Syntax check on the target PHP
+        # Polyfills cannot fix syntax. Only a real parse on the minimum version
+        # catches a typed class constant or an #[\Override] slipping in.
+        run: find src tests -name '*.php' -print0 | xargs -0 -n1 -P4 php -l
+
+      - name: Tests
+        run: vendor/bin/phpunit
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+      - run: composer install --prefer-dist --no-interaction
+      - run: vendor/bin/phpstan analyse -c phpstan.neon.dist --no-progress --memory-limit=1G
+      - run: vendor/bin/phpstan analyse -c phpstan-tests.neon.dist --no-progress --memory-limit=1G
