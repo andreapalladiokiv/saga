@@ -49,7 +49,17 @@ final class InMemorySagaStateRepository implements SagaStateRepository
 
         if ($state->version === 1) {
             if ($existing !== null) {
-                throw SagaConcurrencyException::versionMismatch($state->id, 0);
+                // Same event as a primary-key violation in the database
+                // repository, so it must raise the same exception. It used to
+                // raise a concurrency error, and the two are handled in
+                // opposite ways: a lost race is retried and never compensated,
+                // while a duplicate start is idempotency the caller is meant to
+                // catch. A saga launching a child under a derived id hits this
+                // on every retry, and got a rollback from one repository and a
+                // retry loop from the other.
+                throw new SagaAlreadyExistsException(
+                    "Saga '{$state->id}' already exists — start() was called twice for the same id."
+                );
             }
         } elseif ($existing === null) {
             throw SagaConcurrencyException::stateVanished($state->id);

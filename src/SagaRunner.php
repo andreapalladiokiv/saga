@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Techork\Saga;
 
+use Symfony\Component\Workflow\Event\Event;
 use Symfony\Component\Workflow\Exception\InvalidArgumentException as WorkflowInvalidArgumentException;
 use Symfony\Component\Workflow\Marking;
 use Symfony\Component\Workflow\Registry;
@@ -20,6 +21,9 @@ use function array_unique;
 use function array_values;
 use function count;
 use function in_array;
+use function is_string;
+use function method_exists;
+use function sprintf;
 use function str_starts_with;
 
 /**
@@ -80,6 +84,20 @@ final readonly class SagaRunner
      * `$event->getContext()[SagaRunner::SIGNAL_CONTEXT_KEY]`.
      */
     public const SIGNAL_CONTEXT_KEY = 'saga.signal';
+
+    /**
+     * Where every apply puts the saga id, so a listener can read it with
+     * {@see sagaId()}.
+     *
+     * Symfony's Event exposes the subject, the marking, the transition and the
+     * workflow name — which is the saga FQCN, the same for every instance. The
+     * id is the one thing a listener cannot otherwise reach, and it is what a
+     * step needs to name anything outside itself: a child saga's id, a log line,
+     * an idempotency key at a payment provider. Without it the only way to know
+     * which saga you are is to copy the id into the subject at start() and hope
+     * every caller remembers.
+     */
+    public const SAGA_ID_CONTEXT_KEY = 'saga.id';
 
     public function __construct(
         private SagaStateRepository      $repository,
@@ -266,19 +284,20 @@ final readonly class SagaRunner
 
         $this->markingStore->setMarking($subject, new Marking($state->marking));
 
+        $signals = $this->enabledSignals($workflow, $subject);
         $matching = array_values(array_filter(
-            $this->enabledSignals($workflow, $subject),
+            $signals,
             static fn(Signal $signal): bool => $signal->accepts($payload),
         ));
 
         if ($matching === []) {
             $awaited = array_map(
                 static fn(Signal $signal): string => $signal->getName().' awaits '.$signal->awaits,
-                $this->enabledSignals($workflow, $subject),
+                $signals,
             );
             $payloadClass = $payload::class;
 
-            throw new SagaException("Saga '$sagaId' is not waiting for a $payloadClass. "
+            throw new SagaNotWaitingException("Saga '$sagaId' is not waiting for a $payloadClass. "
                 . ($awaited === []
                     ? 'It has no signal enabled at all — it is either moving or stalled, not parked.'
                     : 'Enabled signals: '.implode('; ', $awaited).'.'));
@@ -304,6 +323,37 @@ final readonly class SagaRunner
         );
 
         return [SignalOutcome::Applied, $dispatch];
+    }
+
+    /**
+     * The id of the saga this event belongs to.
+     *
+     * The counterpart of {@see Signal::payload()}: same channel, same reason —
+     * reading the context directly means indexing an `array<mixed>` by a string
+     * key that no static analyser can check.
+     *
+     *     $childId = SagaRunner::sagaId($event) . ':intent';
+     *
+     * @param  Event<object>  $event
+     *
+     * @throws SagaException when the event did not come from an apply this
+     *                       runner drove
+     */
+    public static function sagaId(Event $event): string
+    {
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
+        $id = $context[self::SAGA_ID_CONTEXT_KEY] ?? null;
+
+        if (!is_string($id)) {
+            throw new SagaException(sprintf(
+                "No saga id on the event for transition '%s'. Guards run before the context exists, "
+                . 'so a guard can never ask this; and an apply() called outside %s carries nothing.',
+                $event->getTransition()?->getName() ?? '?',
+                self::class,
+            ));
+        }
+
+        return $id;
     }
 
     /**
@@ -373,7 +423,10 @@ final readonly class SagaRunner
         string $transition,
         array $context,
     ): array {
-        $workflow->apply($subject, $transition, $context);
+        // The id goes in for every apply, not just a signal's: it is the only
+        // way a listener can tell which instance it is running for. Listed
+        // first so a caller's own context always wins on a key clash.
+        $workflow->apply($subject, $transition, [self::SAGA_ID_CONTEXT_KEY => $sagaId, ...$context]);
 
         $newMarking = $this->markingStore->getMarking($subject);
         $history = [...$state->history, $transition];

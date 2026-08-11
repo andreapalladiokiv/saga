@@ -5,14 +5,10 @@ declare(strict_types=1);
 namespace Techork\Saga;
 
 use Symfony\Component\Workflow\Arc;
-use Symfony\Component\Workflow\Event\AnnounceEvent;
-use Symfony\Component\Workflow\Event\CompletedEvent;
-use Symfony\Component\Workflow\Event\EnterEvent;
-use Symfony\Component\Workflow\Event\EnteredEvent;
-use Symfony\Component\Workflow\Event\LeaveEvent;
-use Symfony\Component\Workflow\Event\TransitionEvent;
+use Symfony\Component\Workflow\Event\Event;
 use Symfony\Component\Workflow\Transition;
 
+use function get_debug_type;
 use function sprintf;
 
 /**
@@ -95,36 +91,30 @@ final class Signal extends Transition
      *
      * @template T of object
      *
-     * @param  AnnounceEvent<object>|CompletedEvent<object>|EnterEvent<object>|EnteredEvent<object>|LeaveEvent<object>|TransitionEvent<object>  $event
+     * @param  Event<T>  $event
      * @param  class-string<T>  $expected
      * @return T
      *
      * @throws SagaException when the transition was not fired by
      *                       {@see SagaRunner::signal()}, or carried another type
      */
-    public static function payload(
-        AnnounceEvent|CompletedEvent|EnterEvent|EnteredEvent|LeaveEvent|TransitionEvent $event,
-        string $expected,
-    ): object {
-        $context = $event->getContext();
+    public static function payload(Event $event, string $expected): object
+    {
         $key = SagaRunner::SIGNAL_CONTEXT_KEY;
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
 
-        if (! isset($context[$key])) {
-            throw new SagaException(sprintf(
-                "Transition '%s' carries no signal payload. Either it is not a %s, or it was fired by "
-                . 'run() rather than signal().',
-                $event->getTransition()?->getName() ?? '?',
-                self::class,
-            ));
-        }
-
-        $payload = $context[$key];
+        $payload = $context[$key] ?? throw new SagaException(sprintf(
+            "Transition '%s' carries no signal payload. Either it is not a %s, or it was fired by "
+            . 'run() rather than signal().',
+            $event->getTransition()?->getName() ?? '?',
+            self::class,
+        ));
 
         if (! $payload instanceof $expected) {
             throw new SagaException(sprintf(
                 "Transition '%s' was signalled with %s, not %s.",
                 $event->getTransition()?->getName() ?? '?',
-                \get_debug_type($payload),
+                get_debug_type($payload),
                 $expected,
             ));
         }
