@@ -40,8 +40,14 @@ use function sprintf;
  * an ordinary guarded transition out of the same place, which the graph already
  * expresses. And a transformation hook: the payload is folded into the subject by
  * the Signal's own transition listener, like every other action.
+ *
+ * Not final, and only so that {@see Call} can be a Signal: a call is a wait whose
+ * answer happens to come from a saga the runner started for it. Everything that
+ * treats a Signal as "the runner never fires this" and "signal() is the only way
+ * in" is then true of a Call for free. Do not subclass it for anything else —
+ * every such rule keys on `instanceof Signal`.
  */
-final class Signal extends Transition
+class Signal extends Transition
 {
     /**
      * @param  string|string[]|Arc[]  $froms  where the saga parks

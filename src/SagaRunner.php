@@ -14,6 +14,8 @@ use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use Techork\Saga\Event\CompensateEvent;
 use Throwable;
 
+use const JSON_THROW_ON_ERROR;
+
 use function array_fill_keys;
 use function array_keys;
 use function array_map;
@@ -22,9 +24,13 @@ use function array_values;
 use function count;
 use function in_array;
 use function is_string;
+use function json_decode;
+use function json_encode;
 use function method_exists;
 use function sprintf;
 use function str_starts_with;
+use function strlen;
+use function substr;
 
 /**
  * Drives a Symfony Workflow saga: one transition per invocation.
@@ -99,6 +105,32 @@ final readonly class SagaRunner
      */
     public const SAGA_ID_CONTEXT_KEY = 'saga.id';
 
+    /**
+     * Where every apply puts the step's {@see SagaOutbox}, so {@see reply()} can
+     * reach it. A per-step object: a step that throws never persists, and its
+     * outbox dies with it, so nothing it asked for happens.
+     */
+    public const OUTBOX_CONTEXT_KEY = 'saga.outbox';
+
+    /**
+     * Where the apply context carries who called this saga, for {@see reply()}.
+     *
+     * Read out of the row's own history rather than passed around: a child is
+     * signalled by webhooks and workers that know nothing about its caller.
+     */
+    private const CALLER_CONTEXT_KEY = 'saga.caller';
+
+    /**
+     * Journalled into `history` at birth when a {@see Call} started this saga,
+     * carrying the caller's class, id and the Call's name.
+     *
+     * The row has to remember its caller — the answer arrives a park later, in
+     * another process — and history is a column that already exists and already
+     * reserves this prefix. Deriving it from the child's id instead would make
+     * the id format load-bearing, and ids are the user's in every other case.
+     */
+    private const CALLER = '!saga:caller:';
+
     public function __construct(
         private SagaStateRepository      $repository,
         private SagaQueue                $queue,
@@ -106,6 +138,7 @@ final readonly class SagaRunner
         private Registry                 $workflows,
         private SagaMarkingStore         $markingStore,
         private SagaLock                 $lock,
+        private SagaLocator              $sagas = new NewInstanceSagaLocator(),
     ) {}
 
     /**
@@ -117,20 +150,37 @@ final readonly class SagaRunner
      */
     public function start(Saga $saga, string $sagaId, object $subject): SagaState
     {
-        /** @var array{SagaState, list<string>} $result */
+        return $this->startSeeded($saga, $sagaId, $subject, []);
+    }
+
+    /**
+     * start(), with a history the runner seeds itself.
+     *
+     * The only seed is the {@see CALLER} marker, written when a {@see Call}
+     * launches a child so the child's row remembers who to answer.
+     *
+     * @param  list<string>  $history
+     */
+    private function startSeeded(Saga $saga, string $sagaId, object $subject, array $history): SagaState
+    {
+        /** @var array{SagaState, list<string>, SagaOutbox} $result */
         $result = $this->lock->withLock(
             $sagaId,
-            fn(): array => $this->startExclusively($saga, $sagaId, $subject),
+            fn(): array => $this->startExclusively($saga, $sagaId, $subject, $history),
         );
 
-        [$state, $dispatch] = $result;
+        [$state, $dispatch, $outbox] = $result;
         $this->dispatch($saga, $sagaId, $dispatch);
+        $this->perform($outbox);
 
         return $state;
     }
 
-    /** @return array{SagaState, list<string>} the new state, and the transitions to enqueue */
-    private function startExclusively(Saga $saga, string $sagaId, object $subject): array
+    /**
+     * @param  list<string>  $history
+     * @return array{SagaState, list<string>, SagaOutbox} state, what to enqueue, what to do to other sagas
+     */
+    private function startExclusively(Saga $saga, string $sagaId, object $subject, array $history): array
     {
         // One source of truth: the workflow the registry will actually apply,
         // not $saga->definition(), which may have drifted from it.
@@ -145,6 +195,7 @@ final readonly class SagaRunner
         $this->markingStore->setMarking($subject, $marking);
 
         $this->assertTransitionNamesAreUnique($workflow, $saga);
+        $this->assertAtMostOneCallPerPlace($workflow, $saga);
 
         $enabledTransitions = $workflow->getEnabledTransitions($subject);
         $enabled = $this->namesOf($this->withoutSignals($enabledTransitions));
@@ -159,10 +210,16 @@ final readonly class SagaRunner
                 . 'so nothing can ever fire. This is a definition bug.');
         }
 
-        $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, version: 1);
+        $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, $history, version: 1);
         $this->repository->save($state);
 
-        return [$state, $enabled];
+        // A saga may be born already parked on a Call — its first place has one
+        // leaving it — in which case the child is launched here rather than by a
+        // later step.
+        $outbox = new SagaOutbox();
+        $this->collectLaunches($saga, $sagaId, $workflow, $enabledTransitions, $initial, $state->history, $outbox);
+
+        return [$state, $enabled, $outbox];
     }
 
     /**
@@ -218,14 +275,15 @@ final readonly class SagaRunner
      */
     public function run(Saga $saga, string $sagaId, string $transition): void
     {
-        /** @var array{bool, list<string>} $result */
+        /** @var array{bool, list<string>, SagaOutbox} $result */
         $result = $this->lock->withLock(
             $sagaId,
             fn(): array => $this->advanceExclusively($saga, $sagaId, $transition),
         );
 
-        [, $dispatch] = $result;
+        [, $dispatch, $outbox] = $result;
         $this->dispatch($saga, $sagaId, $dispatch);
+        $this->perform($outbox);
     }
 
     /**
@@ -255,24 +313,25 @@ final readonly class SagaRunner
      */
     public function signal(Saga $saga, string $sagaId, object $payload): SignalOutcome
     {
-        /** @var array{SignalOutcome, list<string>} $result */
+        /** @var array{SignalOutcome, list<string>, SagaOutbox} $result */
         $result = $this->lock->withLock(
             $sagaId,
             fn(): array => $this->signalExclusively($saga, $sagaId, $payload),
         );
 
-        [$outcome, $dispatch] = $result;
+        [$outcome, $dispatch, $outbox] = $result;
         $this->dispatch($saga, $sagaId, $dispatch);
+        $this->perform($outbox);
 
         return $outcome;
     }
 
-    /** @return array{SignalOutcome, list<string>} */
+    /** @return array{SignalOutcome, list<string>, SagaOutbox} */
     private function signalExclusively(Saga $saga, string $sagaId, object $payload): array
     {
         $state = $this->repository->load($sagaId);
         if ($state === null) {
-            return [SignalOutcome::NotFound, []];
+            return [SignalOutcome::NotFound, [], new SagaOutbox()];
         }
 
         $this->assertRollbackIsNotIncomplete($state, $sagaId);
@@ -313,7 +372,8 @@ final readonly class SagaRunner
 
         // From here it is an ordinary apply, with the payload riding Symfony's
         // own context channel.
-        [, $dispatch] = $this->applyAndPersist(
+        [, $dispatch, $outbox] = $this->applyAndPersist(
+            $saga,
             $sagaId,
             $state,
             $workflow,
@@ -322,7 +382,7 @@ final readonly class SagaRunner
             [self::SIGNAL_CONTEXT_KEY => $payload],
         );
 
-        return [SignalOutcome::Applied, $dispatch];
+        return [SignalOutcome::Applied, $dispatch, $outbox];
     }
 
     /**
@@ -357,6 +417,263 @@ final readonly class SagaRunner
     }
 
     /**
+     * The child's answer to whoever called it.
+     *
+     * The only way a saga addresses another saga, and it can address exactly one:
+     * the {@see Call} that started it. That narrowness is the whole safety
+     * argument — there is no target to get wrong, no lock to take in the wrong
+     * order, and no way to build a cycle. Compare a hand-written bridge, which
+     * can signal anything from anywhere and deadlocks the moment two sagas reach
+     * for each other.
+     *
+     *     SagaRunner::reply($event, new PaymentAuthorized($code));
+     *
+     * The answer is not sent here. It is recorded in the step's outbox and
+     * delivered once this saga's lock is released, so the caller is signalled
+     * with nothing held. A step that throws never persists and its answer is
+     * dropped with it.
+     *
+     * Answering is not tied to finishing: a saga may answer at any step and carry
+     * on. What the caller does with the answer is the caller's business — it
+     * arrives as the Call's payload and its listener reads it with
+     * {@see Signal::payload()}.
+     *
+     * @param  Event<object>  $event
+     *
+     * @throws SagaException when this saga has no caller, or the event did not
+     *                       come from an apply this runner drove
+     */
+    public static function reply(Event $event, object $payload): void
+    {
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
+
+        $outbox = $context[self::OUTBOX_CONTEXT_KEY] ?? null;
+        if (! $outbox instanceof SagaOutbox) {
+            throw new SagaException(sprintf(
+                "Cannot reply from transition '%s': the event did not come from an apply driven by %s.",
+                $event->getTransition()?->getName() ?? '?',
+                self::class,
+            ));
+        }
+
+        $caller = $context[self::CALLER_CONTEXT_KEY] ?? null;
+        if ($caller === null) {
+            throw new SagaException(sprintf(
+                "Cannot reply from transition '%s': this saga has no caller. Only a saga started by a %s "
+                . 'has something to answer; one started directly has nowhere to send it.',
+                $event->getTransition()?->getName() ?? '?',
+                Call::class,
+            ));
+        }
+
+        [$callerClass, $callerId] = $caller;
+        $outbox->add(new DeliverReply($callerClass, $callerId, $payload));
+    }
+
+    /**
+     * Runs what a step asked to have done to other sagas, with no lock held.
+     *
+     * Deliberately after {@see SagaLock::withLock()} returns, for the same reason
+     * {@see dispatch()} is: reaching into a second saga while holding the first
+     * one's lock is what deadlocks an inline queue driver, and it is what a
+     * hand-written bridge cannot avoid. Here the runner owns both ends, so it can
+     * choose the safe moment.
+     *
+     * Failures are not swallowed — a child that cannot be started, or an answer
+     * that cannot be delivered, means the flow has stalled and the caller (a
+     * queue job) should hear about it. The exceptions a redelivered step
+     * legitimately produces are the two that mean 'already done', and those are
+     * absorbed at each action.
+     */
+    private function perform(SagaOutbox $outbox): void
+    {
+        foreach ($outbox->actions() as $action) {
+            if ($action instanceof LaunchChild) {
+                $this->launch($action);
+
+                continue;
+            }
+
+            $this->deliver($action);
+        }
+    }
+
+    private function launch(LaunchChild $launch): void
+    {
+        $child = $this->sagas->get($launch->sagaClass);
+
+        $caller = self::CALLER.json_encode([
+            $launch->callerClass,
+            $launch->callerId,
+            $launch->callerTransition,
+        ], JSON_THROW_ON_ERROR);
+
+        try {
+            $this->startSeeded($child, $launch->childId, $launch->subject, [$caller]);
+        } catch (SagaAlreadyExistsException) {
+            // The child is already there: the step was redelivered, or the
+            // recovery sweep got here first. The id is derived precisely so this
+            // is a no-op rather than a second child.
+        }
+    }
+
+    private function deliver(DeliverReply $reply): void
+    {
+        $caller = $this->sagas->get($reply->callerClass);
+
+        try {
+            $this->signal($caller, $reply->callerId, $reply->payload);
+        } catch (SagaNotWaitingException) {
+            // The caller already consumed an answer and moved on. Answers are
+            // at-least-once, so this is the expected shape of a duplicate, not a
+            // fault. A caller that no longer exists is SignalOutcome::NotFound
+            // and already silent.
+        }
+    }
+
+    /**
+     * Records a launch for every Call the saga has just parked on.
+     *
+     * A Call fires nothing by itself — it is a {@see Signal} — so what makes it
+     * different is only this: entering the place it leaves starts the saga it
+     * names. Guards are respected, because a Call its guard blocks is not a wait
+     * the saga is actually in.
+     *
+     * @param  array<Transition>  $enabled  what is fireable from the new marking
+     * @param  array<string>  $entered  the places this step just put a token in
+     * @param  array<string>  $history  including the step just applied
+     */
+    private function collectLaunches(
+        Saga $saga,
+        string $sagaId,
+        WorkflowInterface $workflow,
+        array $enabled,
+        array $entered,
+        array $history,
+        SagaOutbox $outbox,
+    ): void {
+        foreach ($enabled as $transition) {
+            if (! $transition instanceof Call) {
+                continue;
+            }
+
+            $parking = null;
+            foreach ($transition->getFroms() as $from) {
+                if (in_array($from, $entered, true)) {
+                    $parking = $from;
+                    break;
+                }
+            }
+
+            if ($parking === null) {
+                // Enabled, but the saga did not arrive here on this step — the
+                // child was launched when it did. Launching again would be a
+                // second child for one wait.
+                continue;
+            }
+
+            $state = $this->repository->load($sagaId);
+            if ($state === null) {
+                continue;
+            }
+
+            $outbox->add(new LaunchChild(
+                $transition->runs,
+                self::childId(
+                    $sagaId,
+                    $transition->getName(),
+                    $this->timesEntered($workflow, $history, $parking),
+                ),
+                $transition->subjectFor($state->subject),
+                $saga::class,
+                $sagaId,
+                $transition->getName(),
+            ));
+        }
+    }
+
+    /**
+     * The child's id: derived, never supplied.
+     *
+     * Two things follow from deriving it. A parent that loops back for a second
+     * attempt gets a distinct child instead of colliding with the first, because
+     * the count of steps taken differs. And a launch lost between the parent's
+     * commit and {@see perform()} is recoverable: {@see requeue()} recomputes the
+     * same id and creates what is missing.
+     */
+    private static function childId(string $parentId, string $transition, int $attempt): string
+    {
+        return $parentId.'/'.$transition.'/'.$attempt;
+    }
+
+    /**
+     * How many times the saga has entered $place, counted from history.
+     *
+     * This is the attempt number, and it has to be entries into the PLACE rather
+     * than steps taken: a parent that comes back for a second payment reaches the
+     * parking place by a different transition than the first time, and counting
+     * anything else either collides the two children or makes the id depend on
+     * unrelated steps.
+     *
+     * @param  array<string>  $history
+     */
+    private function timesEntered(WorkflowInterface $workflow, array $history, string $place): int
+    {
+        $entering = [];
+        foreach ($workflow->getDefinition()->getTransitions() as $transition) {
+            if (in_array($place, $transition->getTos(), true)) {
+                $entering[$transition->getName()] = true;
+            }
+        }
+
+        $times = 0;
+        foreach ($history as $entry) {
+            if (isset($entering[$entry])) {
+                $times++;
+            }
+        }
+
+        return $times;
+    }
+
+    /**
+     * The places a transition puts tokens in.
+     *
+     * @return list<string>
+     */
+    private function targetsOf(WorkflowInterface $workflow, string $transition): array
+    {
+        foreach ($workflow->getDefinition()->getTransitions() as $candidate) {
+            if ($candidate->getName() === $transition) {
+                return array_values($candidate->getTos());
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * Who called this saga, if a {@see Call} did.
+     *
+     * @return array{class-string<Saga>, string, string}|null
+     */
+    private function callerOf(SagaState $state): ?array
+    {
+        foreach ($state->history as $entry) {
+            if (! str_starts_with($entry, self::CALLER)) {
+                continue;
+            }
+
+            /** @var array{class-string<Saga>, string, string} $caller */
+            $caller = json_decode(substr($entry, strlen(self::CALLER)), true, 512, JSON_THROW_ON_ERROR);
+
+            return $caller;
+        }
+
+        return null;
+    }
+
+    /**
      * The Signals currently fireable — what the saga is parked on.
      *
      * @return list<Signal>
@@ -369,7 +686,7 @@ final readonly class SagaRunner
         ));
     }
 
-    /** @return array{bool, list<string>} whether the transition applied, and what to enqueue */
+    /** @return array{bool, list<string>, SagaOutbox} applied; what to enqueue; what to do to other sagas */
     private function advanceExclusively(Saga $saga, string $sagaId, string $transition): array
     {
         $state = $this->repository->load($sagaId);
@@ -377,7 +694,7 @@ final readonly class SagaRunner
             // Race: saga was already completed/canceled by a concurrent step.
             // Nothing to do — silently skip rather than throw, since a signal
             // from outside may legitimately race with the forward path.
-            return [false, []];
+            return [false, [], new SagaOutbox()];
         }
 
         $this->assertRollbackIsNotIncomplete($state, $sagaId);
@@ -399,10 +716,10 @@ final readonly class SagaRunner
         // consumed genuinely finds it no longer fireable, rather than racing a
         // concurrent worker into the same apply().
         if (!$workflow->can($subject, $transition)) {
-            return [false, []];
+            return [false, [], new SagaOutbox()];
         }
 
-        return $this->applyAndPersist($sagaId, $state, $workflow, $subject, $transition, []);
+        return $this->applyAndPersist($saga, $sagaId, $state, $workflow, $subject, $transition, []);
     }
 
     /**
@@ -413,9 +730,10 @@ final readonly class SagaRunner
      * step. The only difference is the apply context.
      *
      * @param  array<string, mixed>  $context  Symfony's per-apply context
-     * @return array{bool, list<string>}
+     * @return array{bool, list<string>, SagaOutbox}
      */
     private function applyAndPersist(
+        Saga $saga,
         string $sagaId,
         SagaState $state,
         WorkflowInterface $workflow,
@@ -423,21 +741,39 @@ final readonly class SagaRunner
         string $transition,
         array $context,
     ): array {
-        // The id goes in for every apply, not just a signal's: it is the only
-        // way a listener can tell which instance it is running for. Listed
-        // first so a caller's own context always wins on a key clash.
-        $workflow->apply($subject, $transition, [self::SAGA_ID_CONTEXT_KEY => $sagaId, ...$context]);
+        $outbox = new SagaOutbox();
+
+        // The id, the outbox and the caller go in for every apply, not just a
+        // signal's. Listed first so a caller's own context wins on a key clash.
+        $workflow->apply($subject, $transition, [
+            self::SAGA_ID_CONTEXT_KEY => $sagaId,
+            self::OUTBOX_CONTEXT_KEY => $outbox,
+            self::CALLER_CONTEXT_KEY => $this->callerOf($state),
+            ...$context,
+        ]);
 
         $newMarking = $this->markingStore->getMarking($subject);
         $history = [...$state->history, $transition];
         $enabled = $workflow->getEnabledTransitions($subject);
+
+        // Entering a place a Call leaves is what launches that Call's saga. The
+        // places just entered are the applied transition's own targets.
+        $this->collectLaunches(
+            $saga,
+            $sagaId,
+            $workflow,
+            $enabled,
+            $this->targetsOf($workflow, $transition),
+            $history,
+            $outbox,
+        );
 
         // Terminal: nothing enabled and nothing structurally outgoing. The saga
         // reached a place that accepts no further moves — clean up and exit.
         if ($enabled === [] && !$this->hasOutgoingTransitions($workflow, $newMarking)) {
             $this->repository->delete($sagaId);
 
-            return [true, []];
+            return [true, [], $outbox];
         }
 
         $this->repository->save(new SagaState(
@@ -459,7 +795,7 @@ final readonly class SagaRunner
         // can() check, which reduce a duplicate to a job that takes the lock,
         // finds its transition consumed and returns. Suppressing them would need
         // the dispatched set persisted, and would buy job count, not correctness.
-        return [true, $this->namesOf($this->withoutSignals($enabled))];
+        return [true, $this->namesOf($this->withoutSignals($enabled)), $outbox];
     }
 
     /**
@@ -581,6 +917,13 @@ final readonly class SagaRunner
         }
 
         for ($i = count($state->history) - 1; $i >= 0; $i--) {
+            // '!saga:' entries are the runner's own journal, not transitions —
+            // dispatching a compensation named after one would look for a
+            // listener that cannot exist.
+            if (str_starts_with($state->history[$i], '!saga:')) {
+                continue;
+            }
+
             $this->compensate($name, $sagaId, $state->history[$i], $subject, $cause, failed: false, errors: $errors);
         }
 
@@ -654,26 +997,94 @@ final readonly class SagaRunner
      */
     public function requeue(Saga $saga, string $sagaId): array
     {
-        /** @var list<string> $dispatch */
-        $dispatch = $this->lock->withLock($sagaId, function () use ($saga, $sagaId): array {
+        /** @var array{list<string>, SagaOutbox} $result */
+        $result = $this->lock->withLock($sagaId, function () use ($saga, $sagaId): array {
             $state = $this->repository->load($sagaId);
             if ($state === null || in_array(self::ROLLBACK_FAILED, $state->history, true)) {
                 // Silent rather than throwing: requeue() is a recovery sweep and
                 // must be safe to run over a whole table.
-                return [];
+                return [[], new SagaOutbox()];
             }
 
             $subject = $state->subject;
             $this->markingStore->setMarking($subject, new Marking($state->marking));
 
             $workflow = $this->workflowFor($saga, $subject, $sagaId);
+            $enabled = $workflow->getEnabledTransitions($subject);
 
-            return $this->namesOf($this->withoutSignals($workflow->getEnabledTransitions($subject)));
+            return [
+                $this->namesOf($this->withoutSignals($enabled)),
+                $this->missingChildren($saga, $sagaId, $state, $workflow, $enabled),
+            ];
         });
 
+        [$dispatch, $outbox] = $result;
         $this->dispatch($saga, $sagaId, $dispatch);
+        $this->perform($outbox);
 
         return $dispatch;
+    }
+
+    /**
+     * Launches a child a parked saga is waiting for but which does not exist.
+     *
+     * The one hole {@see Call} leaves on its own: the parent commits, and the
+     * process dies before {@see perform()} starts the child. The parent is then
+     * parked on an answer nobody will ever send, and nothing is queued against it.
+     *
+     * It is recoverable only because the child's id is derived rather than
+     * supplied — the same inputs give the same id, so 'is it there?' is a question
+     * that can be asked at all. Answers are not recoverable this way: a child that
+     * finished and whose answer was lost has deleted its row, so this finds
+     * nothing missing. It reports a stall it cannot repair.
+     *
+     * @param  array<Transition>  $enabled
+     */
+    private function missingChildren(
+        Saga $saga,
+        string $sagaId,
+        SagaState $state,
+        WorkflowInterface $workflow,
+        array $enabled,
+    ): SagaOutbox {
+        $outbox = new SagaOutbox();
+
+        foreach ($enabled as $transition) {
+            if (! $transition instanceof Call) {
+                continue;
+            }
+
+            $parking = null;
+            foreach ($transition->getFroms() as $from) {
+                if (isset($state->marking[$from])) {
+                    $parking = $from;
+                    break;
+                }
+            }
+            if ($parking === null) {
+                continue;
+            }
+
+            $childId = self::childId(
+                $sagaId,
+                $transition->getName(),
+                $this->timesEntered($workflow, $state->history, $parking),
+            );
+            if ($this->repository->load($childId) !== null) {
+                continue;
+            }
+
+            $outbox->add(new LaunchChild(
+                $transition->runs,
+                $childId,
+                $transition->subjectFor($state->subject),
+                $saga::class,
+                $sagaId,
+                $transition->getName(),
+            ));
+        }
+
+        return $outbox;
     }
 
     /**
@@ -763,6 +1174,38 @@ final readonly class SagaRunner
                     . 'once. Give each arc a distinct name.');
             }
             $seen[$name] = true;
+        }
+    }
+
+    /**
+     * Rejects a place with two Calls leaving it.
+     *
+     * Entering a place launches every Call that leaves it, so two would start two
+     * sagas for one wait — and the parent can only ever consume one answer, so the
+     * other child runs, finishes and finds nobody listening. Alternatives out of a
+     * parking place are meant to be ordinary {@see Signal}s (the attempt failed) or
+     * guarded transitions (the deadline passed); neither launches anything.
+     */
+    private function assertAtMostOneCallPerPlace(WorkflowInterface $workflow, Saga $saga): void
+    {
+        $seen = [];
+
+        foreach ($workflow->getDefinition()->getTransitions() as $transition) {
+            if (! $transition instanceof Call) {
+                continue;
+            }
+
+            foreach ($transition->getFroms() as $from) {
+                if (isset($seen[$from])) {
+                    $sagaClass = $saga::class;
+
+                    throw new SagaException("Saga $sagaClass has two ".Call::class." transitions leaving place '$from' "
+                        . "('{$seen[$from]}' and '{$transition->getName()}'). Entering a place starts every Call that "
+                        . 'leaves it, so this would run two sagas for one wait and leave one of them unanswered. Use a '
+                        . Signal::class.' for the other outcomes.');
+                }
+                $seen[$from] = $transition->getName();
+            }
         }
     }
 
