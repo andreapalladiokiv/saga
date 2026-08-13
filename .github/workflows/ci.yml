@@ -19,13 +19,17 @@ jobs:
         # exist, an illuminate/cache method that reaches for a helper only
         # laravel/framework ships. One lane cannot see any of them.
         include:
-          - { php: '8.2', workflow: '^7.0', laravel: '^11.0', deps: prefer-lowest }
-          - { php: '8.2', workflow: '^7.0', laravel: '^11.0', deps: prefer-stable }
-          - { php: '8.3', workflow: '^7.0', laravel: '^11.0', deps: prefer-stable }
-          - { php: '8.3', workflow: '^7.0', laravel: '^12.0', deps: prefer-stable }
-          - { php: '8.4', workflow: '^8.0', laravel: '^12.0', deps: prefer-stable }
-          - { php: '8.4', workflow: '^8.0', laravel: '^13.0', deps: prefer-stable }
-          - { php: '8.5', workflow: '^8.0', laravel: '^13.0', deps: prefer-stable }
+          # phpunit is pinned per lane too: its own floor rises faster than this
+          # package's. phpunit 13 needs PHP 8.4.1, so the 8.2 and 8.3 lanes could
+          # not install a test runner at all — every one of them was red before
+          # it reached a single assertion.
+          - { php: '8.2', workflow: '^7.4', laravel: '^11.0', phpunit: '^11.5', deps: prefer-lowest }
+          - { php: '8.2', workflow: '^7.4', laravel: '^11.0', phpunit: '^11.5', deps: prefer-stable }
+          - { php: '8.3', workflow: '^7.4', laravel: '^11.0', phpunit: '^12.0', deps: prefer-stable }
+          - { php: '8.3', workflow: '^7.4', laravel: '^12.0', phpunit: '^12.0', deps: prefer-stable }
+          - { php: '8.4', workflow: '^8.0', laravel: '^12.0', phpunit: '^13.1', deps: prefer-stable }
+          - { php: '8.4', workflow: '^8.0', laravel: '^13.0', phpunit: '^13.1', deps: prefer-stable }
+          - { php: '8.5', workflow: '^8.0', laravel: '^13.0', phpunit: '^13.1', deps: prefer-stable }
 
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +42,20 @@ jobs:
 
       - name: Pin the lane's dependencies
         run: |
+          # Every illuminate package has to be listed. One left at the base
+          # constraint drags the whole lane to the newest Laravel and fails on
+          # the lane's PHP — which is exactly what illuminate/encryption, absent
+          # from this list, used to do.
           composer require --no-update --dev \
             "symfony/workflow:${{ matrix.workflow }}" \
+            "phpunit/phpunit:${{ matrix.phpunit }}" \
             "illuminate/contracts:${{ matrix.laravel }}" \
             "illuminate/support:${{ matrix.laravel }}" \
             "illuminate/bus:${{ matrix.laravel }}" \
             "illuminate/cache:${{ matrix.laravel }}" \
             "illuminate/database:${{ matrix.laravel }}" \
             "illuminate/events:${{ matrix.laravel }}" \
+            "illuminate/encryption:${{ matrix.laravel }}" \
             "illuminate/queue:${{ matrix.laravel }}"
           composer config platform.php ${{ matrix.php }}
 
