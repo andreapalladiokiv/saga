@@ -27,6 +27,7 @@ use function implode;
 use function in_array;
 use function is_string;
 use function json_decode;
+use function max;
 use function json_encode;
 use function method_exists;
 use function sprintf;
@@ -197,7 +198,6 @@ final readonly class SagaRunner
         $this->markingStore->setMarking($subject, $marking);
 
         $this->assertTransitionNamesAreUnique($workflow, $saga);
-        $this->assertAtMostOneCallPerPlace($workflow, $saga);
 
         $enabledTransitions = $workflow->getEnabledTransitions($subject);
         $enabled = $this->namesOf($this->withoutSignals($enabledTransitions));
@@ -212,14 +212,16 @@ final readonly class SagaRunner
                 . 'so nothing can ever fire. This is a definition bug.');
         }
 
-        $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, $history, version: 1);
-        $this->repository->save($state);
-
         // A saga may be born already parked on a Call — its first place has one
         // leaving it — in which case the child is launched here rather than by a
-        // later step.
+        // later step. Collected BEFORE the row is written, so a saga the runner
+        // refuses leaves nothing behind.
         $outbox = new SagaOutbox();
-        $this->collectLaunches($saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial, $state->history, $outbox);
+        $this->collectLaunches($saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial,
+            $this->markingToArray($marking), $history, $outbox);
+
+        $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, $history, version: 1);
+        $this->repository->save($state);
 
         return [$state, $enabled, $outbox];
     }
@@ -607,6 +609,7 @@ final readonly class SagaRunner
      *                            one that obtained what the child needs.
      * @param  array<Transition>  $enabled  what is fireable from the new marking
      * @param  array<string>  $entered  the places this step just put a token in
+     * @param  array<string, int>  $marking  place => tokens, after the step
      * @param  array<string>  $history  including the step just applied
      */
     private function collectLaunches(
@@ -616,9 +619,12 @@ final readonly class SagaRunner
         WorkflowInterface $workflow,
         array $enabled,
         array $entered,
+        array $marking,
         array $history,
         SagaOutbox $outbox,
     ): void {
+        $launched = [];
+
         foreach ($enabled as $transition) {
             if (! $transition instanceof Call) {
                 continue;
@@ -638,6 +644,9 @@ final readonly class SagaRunner
                 // second child for one wait.
                 continue;
             }
+
+            $launched[$parking][] = $transition->getName();
+            $this->assertThePlaceCanAnswerThemAll($saga, $sagaId, $parking, $launched[$parking], $marking);
 
             $attempt = $this->timesEntered($workflow, $history, $parking);
             $childSubject = $transition->subjectFor($subject);
@@ -669,6 +678,54 @@ final readonly class SagaRunner
     }
 
     /**
+     * Refuses to start more children than a place can ever answer.
+     *
+     * Several Calls may leave one place. Which of them is live is a question only
+     * the marking and the guards can answer, so this is checked when the launches
+     * are collected and not when the definition is read — a static check over the
+     * definition rejects the shape, and the shape is legitimate: two Calls out of
+     * one place, guarded to be exclusive, is how a saga chooses WHICH saga to run
+     * from what it knows.
+     *
+     * What is not legitimate is more live Calls than the place has tokens. A
+     * Call's answer fires that Call, and firing it consumes a token from the
+     * place; so a place holding one token can see exactly one of its Calls
+     * through, and any further child would run to the end, with whatever side
+     * effects it has, and find its answer unusable. Note that this is the net's
+     * arithmetic and not a rule of this package: a place with several outgoing
+     * transitions is a CHOICE, and one token can only take one of them.
+     *
+     * A genuine fork is a transition with several targets, one Call per branch —
+     * different places, so nothing here objects. A place carrying two tokens can
+     * likewise see two of its Calls through, and that is allowed too.
+     *
+     * @param  list<string>  $live  the Calls collected for this place so far
+     * @param  array<string, int>  $marking  place => tokens
+     */
+    private function assertThePlaceCanAnswerThemAll(
+        Saga $saga,
+        string $sagaId,
+        string $place,
+        array $live,
+        array $marking,
+    ): void {
+        $tokens = $marking[$place] ?? 0;
+
+        if (count($live) <= $tokens) {
+            return;
+        }
+
+        $sagaClass = $saga::class;
+        $names = implode(', ', array_map(static fn(string $n): string => "'$n'", $live));
+
+        throw new SagaException("Saga '$sagaId' ($sagaClass) has ".count($live).' '.Call::class." transitions fireable "
+            . "out of place '$place' ($names) but that place holds $tokens token(s). Firing a Call consumes a token, "
+            . "so only $tokens of them can ever be answered; the rest would run to the end and find their answer "
+            . 'unusable. Guard them so no more are live at once than the place can see through, or fork with a '
+            . 'transition that puts a token in a place of its own for each branch.');
+    }
+
+    /**
      * The child's id: the Call's own rule when it declares one, else the
      * runner's.
      *
@@ -691,25 +748,33 @@ final readonly class SagaRunner
      * anything else either collides the two children or makes the id depend on
      * unrelated steps.
      *
+     * Being born in a place counts as entering it. Nothing writes that to history
+     * — no transition ran — so without it a saga whose very first place has a Call
+     * leaving it would report attempt 0 while every other first attempt reports 1,
+     * and an id rule taking $attempt would see the difference.
+     *
      * @param  array<string>  $history
+     * @return int<1, max>
      */
     private function timesEntered(WorkflowInterface $workflow, array $history, string $place): int
     {
+        $definition = $workflow->getDefinition();
+
         $entering = [];
-        foreach ($workflow->getDefinition()->getTransitions() as $transition) {
+        foreach ($definition->getTransitions() as $transition) {
             if (in_array($place, $transition->getTos(), true)) {
                 $entering[$transition->getName()] = true;
             }
         }
 
-        $times = 0;
+        $times = in_array($place, $definition->getInitialPlaces(), true) ? 1 : 0;
         foreach ($history as $entry) {
             if (isset($entering[$entry])) {
                 $times++;
             }
         }
 
-        return $times;
+        return max(1, $times);
     }
 
     /**
@@ -843,6 +908,7 @@ final readonly class SagaRunner
             $workflow,
             $enabled,
             $this->targetsOf($workflow, $transition),
+            $this->markingToArray($newMarking),
             $history,
             $outbox,
         );
@@ -1127,6 +1193,7 @@ final readonly class SagaRunner
         array $enabled,
     ): SagaOutbox {
         $outbox = new SagaOutbox();
+        $launched = [];
 
         foreach ($enabled as $transition) {
             if (! $transition instanceof Call) {
@@ -1143,6 +1210,9 @@ final readonly class SagaRunner
             if ($parking === null) {
                 continue;
             }
+
+            $launched[$parking][] = $transition->getName();
+            $this->assertThePlaceCanAnswerThemAll($saga, $sagaId, $parking, $launched[$parking], $state->marking);
 
             $attempt = $this->timesEntered($workflow, $state->history, $parking);
             $childSubject = $transition->subjectFor($state->subject);
@@ -1308,38 +1378,6 @@ final readonly class SagaRunner
         )).' to the apply context. That context lasts for one apply() and is then dropped — nothing '
             . 'persists it, so the value would be gone by the next step. Put anything that has to outlive '
             . 'the step on the subject instead, which is what SagaState stores.');
-    }
-
-    /**
-     * Rejects a place with two Calls leaving it.
-     *
-     * Entering a place launches every Call that leaves it, so two would start two
-     * sagas for one wait — and the parent can only ever consume one answer, so the
-     * other child runs, finishes and finds nobody listening. Alternatives out of a
-     * parking place are meant to be ordinary {@see Signal}s (the attempt failed) or
-     * guarded transitions (the deadline passed); neither launches anything.
-     */
-    private function assertAtMostOneCallPerPlace(WorkflowInterface $workflow, Saga $saga): void
-    {
-        $seen = [];
-
-        foreach ($workflow->getDefinition()->getTransitions() as $transition) {
-            if (! $transition instanceof Call) {
-                continue;
-            }
-
-            foreach ($transition->getFroms() as $from) {
-                if (isset($seen[$from])) {
-                    $sagaClass = $saga::class;
-
-                    throw new SagaException("Saga $sagaClass has two ".Call::class." transitions leaving place '$from' "
-                        . "('{$seen[$from]}' and '{$transition->getName()}'). Entering a place starts every Call that "
-                        . 'leaves it, so this would run two sagas for one wait and leave one of them unanswered. Use a '
-                        . Signal::class.' for the other outcomes.');
-                }
-                $seen[$from] = $transition->getName();
-            }
-        }
     }
 
     /**
