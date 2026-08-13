@@ -217,7 +217,7 @@ final readonly class SagaRunner
         // leaving it — in which case the child is launched here rather than by a
         // later step.
         $outbox = new SagaOutbox();
-        $this->collectLaunches($saga, $sagaId, $workflow, $enabledTransitions, $initial, $state->history, $outbox);
+        $this->collectLaunches($saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial, $state->history, $outbox);
 
         return [$state, $enabled, $outbox];
     }
@@ -471,6 +471,28 @@ final readonly class SagaRunner
     }
 
     /**
+     * Whether this saga was started by a {@see Call}, and so has somewhere to
+     * {@see reply()}.
+     *
+     * A saga worth reusing is one that runs both ways — launched by a Call from
+     * some larger flow, and started directly by an endpoint or an operator. Such
+     * a saga has to ask, and asking by catching the exception reply() throws
+     * would mean matching on a message.
+     *
+     *     if (SagaRunner::hasCaller($event)) {
+     *         SagaRunner::reply($event, new PaymentAuthorized($code));
+     *     }
+     *
+     * @param  Event<object>  $event
+     */
+    public static function hasCaller(Event $event): bool
+    {
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
+
+        return isset($context[self::CALLER_CONTEXT_KEY]);
+    }
+
+    /**
      * Runs what a step asked to have done to other sagas, with no lock held.
      *
      * Deliberately after {@see SagaLock::withLock()} returns, for the same reason
@@ -539,6 +561,11 @@ final readonly class SagaRunner
      * names. Guards are respected, because a Call its guard blocks is not a wait
      * the saga is actually in.
      *
+     * @param  object  $subject  the LIVE subject, as the step just left it — not the
+     *                            stored row, which is a step behind and, once a codec
+     *                            has decoded it, a different object entirely. The step
+     *                            carrying the saga into a parking place is usually the
+     *                            one that obtained what the child needs.
      * @param  array<Transition>  $enabled  what is fireable from the new marking
      * @param  array<string>  $entered  the places this step just put a token in
      * @param  array<string>  $history  including the step just applied
@@ -546,6 +573,7 @@ final readonly class SagaRunner
     private function collectLaunches(
         Saga $saga,
         string $sagaId,
+        object $subject,
         WorkflowInterface $workflow,
         array $enabled,
         array $entered,
@@ -572,11 +600,6 @@ final readonly class SagaRunner
                 continue;
             }
 
-            $state = $this->repository->load($sagaId);
-            if ($state === null) {
-                continue;
-            }
-
             $outbox->add(new LaunchChild(
                 $transition->runs,
                 self::childId(
@@ -584,7 +607,7 @@ final readonly class SagaRunner
                     $transition->getName(),
                     $this->timesEntered($workflow, $history, $parking),
                 ),
-                $transition->subjectFor($state->subject),
+                $transition->subjectFor($subject),
                 $saga::class,
                 $sagaId,
                 $transition->getName(),
@@ -761,6 +784,7 @@ final readonly class SagaRunner
         $this->collectLaunches(
             $saga,
             $sagaId,
+            $subject,
             $workflow,
             $enabled,
             $this->targetsOf($workflow, $transition),

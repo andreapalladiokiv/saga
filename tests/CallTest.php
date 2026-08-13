@@ -208,6 +208,25 @@ final class CallTest extends TestCase
         self::assertSame(['awaiting_challenge' => 1], $state->marking);
     }
 
+    public function testTheChildIsBuiltFromWhatTheStepJustWroteNotFromTheStoredRow(): void
+    {
+        // The step that carries the saga into the parking place is usually the
+        // one that obtained what the child needs — a signal folding in a card,
+        // say. Building the child's subject from the row as it was BEFORE that
+        // step loses exactly that.
+        $this->boot();
+        $this->on(CheckoutSaga::class, 'place', function (TransitionEvent $e): void {
+            $e->getSubject()->amount = '99.00';
+        });
+
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+
+        $child = $this->repository->load($this->childOf('chk-1', 'pay', 1));
+        self::assertNotNull($child);
+        self::assertInstanceOf(PaymentIntentSubject::class, $child->subject);
+        self::assertSame('99.00', $child->subject->amount);
+    }
+
     public function testTheParentParksOnTheCallAndNothingIsQueuedForIt(): void
     {
         $this->boot();
@@ -303,6 +322,25 @@ final class CallTest extends TestCase
         self::assertContains('checkout:declined:no funds', $this->log);
         self::assertSame(['declined' => 1], $this->repository->load('chk-1')?->marking,
             'payment_declined is an ordinary Signal out of the parking place');
+    }
+
+    public function testASagaCanAskWhetherAnyoneCalledIt(): void
+    {
+        // The same saga runs both ways: launched by a Call, and started directly
+        // by an endpoint. It has to be able to tell, without matching on the text
+        // of an exception.
+        $this->boot();
+
+        $seen = [];
+        $this->on(PaymentIntentSaga::class, 'create', function (TransitionEvent $e) use (&$seen): void {
+            $seen[SagaRunner::sagaId($e)] = SagaRunner::hasCaller($e);
+        });
+
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+        $this->runner->start($this->intent, 'pi-direct', new PaymentIntentSubject('ord-9', '5.00'));
+
+        self::assertTrue($seen[$this->childOf('chk-1', 'pay', 1)] ?? null, 'a child has a caller');
+        self::assertFalse($seen['pi-direct'] ?? null, 'one started directly has none');
     }
 
     public function testASagaWithNoCallerCannotReply(): void
