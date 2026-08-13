@@ -58,16 +58,18 @@ use Symfony\Component\Workflow\Arc;
  *
  * Several Calls may leave one place, which is how a saga picks WHICH saga to run
  * from what it knows — a card payment or a subscription payment out of the same
- * wait — and their guards decide. What is refused is two of them being fireable
- * at the same moment, because entering the place starts every Call that leaves it
- * and the caller can consume only one answer; the other child would run to the
- * end and find nobody listening. That is a fault in the guards, so it is caught
- * when the launches are collected and not when the definition is read: only the
- * marking and the guards know which Calls are live.
+ * wait — and their guards decide. Nothing checks that the guards are exclusive:
+ * entering the place starts every Call that leaves it, and with one token only
+ * the first answer can fire, so the other child runs for nothing. Whether that
+ * graph makes sense is the author's business; the runner executes the net as
+ * written. Note that two arrows out of a PLACE are a choice — real parallelism
+ * comes out of a transition, or carries an arc weight — so a diagram showing two
+ * Calls on one place is not showing two branches that will both complete.
  *
  * Other exits from a parking place need not be Calls at all — an ordinary Signal
  * for 'the attempt failed', a guarded Transition for 'the deadline passed' — and
- * neither launches anything.
+ * neither launches anything. A child whose answer is not the type its Call
+ * awaits takes one of those instead, chosen by type as any signal is.
  *
  * @see SagaRunner::reply() — how the child answers
  */

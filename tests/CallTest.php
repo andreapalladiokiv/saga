@@ -405,41 +405,85 @@ final class CallTest extends TestCase
         self::assertNotNull($this->repository->load('two-1/ask_b/1'));
     }
 
-    public function testTwoCallsFireableOutOfOnePlaceAtOnceIsRejected(): void
+    public function testTwoCallsFireableOutOfOnePlaceBothRunAndOnlyOneAnswerIsUsed(): void
     {
-        // The actual fault: guards that fail to be exclusive. Both children would
-        // start, and only one answer can ever be consumed.
+        // Whether that graph is a good idea is the author's business — the engine
+        // executes the net as written. One token, so the first answer carries it
+        // away and the second cannot fire: dropped, not raised. What the engine
+        // must not do is mistake it for the answer to a live wait.
         $saga = new class implements Saga
         {
             public function definition(): Definition
             {
-                return new Definition(['a', 'b', 'c'], [
+                return new Definition(['a', 'b', 'c', 'end'], [
                     new Call('one', 'a', 'b',
                         runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
                         subject: static fn (CheckoutSubject $s): object
                             => new PaymentIntentSubject('x', $s->amount)),
                     new Call('two', 'a', 'c',
-                        runs: PaymentIntentSaga::class, awaits: PaymentDeclined::class,
+                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
                         subject: static fn (CheckoutSubject $s): object
                             => new PaymentIntentSubject('y', $s->amount)),
+                    // keeps `b` non-terminal so the row survives for inspection
+                    new Signal('after_b', 'b', 'end', awaits: PaymentDeclined::class),
                 ], ['a']);
             }
         };
         $this->boot();
         $this->registerParent($saga);
 
-        try {
-            $this->runner->start($saga, 'chk-2', new CheckoutSubject('ord-2', '49.99'));
-            self::fail('more live Calls than the place has tokens must be refused');
-        } catch (SagaException $e) {
-            self::assertStringContainsString("place 'a'", $e->getMessage());
-            self::assertStringContainsString('holds 1 token', $e->getMessage());
-            self::assertStringContainsString('choice', $e->getMessage(), 'the message must name what the shape is');
-            self::assertStringContainsString("'one'", $e->getMessage());
-            self::assertStringContainsString("'two'", $e->getMessage());
-        }
+        $this->runner->start($saga, 'chk-2', new CheckoutSubject('ord-2', '49.99'));
 
-        self::assertNull($this->repository->load('chk-2'), 'nothing may be persisted');
+        // both children exist: launches are collected before any answer can arrive
+        self::assertNotNull($this->repository->load('chk-2/one/1'));
+        self::assertNotNull($this->repository->load('chk-2/two/1'));
+
+        // both await the same type, which type-based routing could not tell apart
+        $this->runner->signal($this->intent, 'chk-2/one/1', new ChallengePassed('auth-1'));
+        $parent = $this->repository->load('chk-2');
+        self::assertNotNull($parent);
+        self::assertSame(['b' => 1], $parent->marking,
+            'the answer went to the Call that launched it, not to whichever awaited its type');
+
+        $this->runner->signal($this->intent, 'chk-2/two/1', new ChallengePassed('auth-2'));
+        $parent = $this->repository->load('chk-2');
+        self::assertNotNull($parent);
+        self::assertSame(['b' => 1], $parent->marking,
+            'the token is gone, so the second answer is dropped rather than applied somewhere');
+    }
+
+    public function testAnAnswerFromAnAbandonedAttemptIsNotAppliedToTheCurrentOne(): void
+    {
+        // Measured before the fix: the caller gave up on a deadline, retried, then
+        // heard from the abandoned child — and accepted that answer as the current
+        // attempt's, finishing, while the child it was waiting for answered into
+        // nothing. The graph is correct here; the engine had the attempt number
+        // and ignored it.
+        $this->boot();
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+
+        $first = $this->childOf('chk-1', 'pay', 1);
+        self::assertNotNull($this->repository->load($first));
+
+        // the deadline passes: the caller declines and retries while child 1 runs
+        $this->runner->signal($this->checkout, 'chk-1', new PaymentDeclined('deadline'));
+        $this->allowRetry = true;
+        $this->runner->run($this->checkout, 'chk-1', 'retry');
+
+        $second = $this->childOf('chk-1', 'pay', 2);
+        self::assertNotNull($this->repository->load($second), 'attempt 2 is under way');
+        self::assertNotNull($this->repository->load($first), 'attempt 1 is still running');
+
+        // the abandoned child answers, late
+        $this->runner->signal($this->intent, $first, new ChallengePassed('stale'));
+
+        self::assertSame(['awaiting_payment' => 1], $this->repository->load('chk-1')?->marking,
+            'a stale answer must not settle the wait that is actually in progress');
+        self::assertNotContains('checkout:authorized:stale', $this->log);
+
+        // and the child the caller is waiting for still can
+        $this->runner->signal($this->intent, $second, new ChallengePassed('auth-2'));
+        self::assertContains('checkout:authorized:auth-2', $this->log);
     }
 
     // ───────────────── the answer ─────────────────

@@ -217,8 +217,7 @@ final readonly class SagaRunner
         // later step. Collected BEFORE the row is written, so a saga the runner
         // refuses leaves nothing behind.
         $outbox = new SagaOutbox();
-        $this->collectLaunches($saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial,
-            $this->markingToArray($marking), $history, $outbox);
+        $this->collectLaunches($saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial, $history, $outbox);
 
         $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, $history, version: 1);
         $this->repository->save($state);
@@ -470,8 +469,8 @@ final readonly class SagaRunner
             ));
         }
 
-        [$callerClass, $callerId] = $caller;
-        $outbox->add(new DeliverReply($callerClass, $callerId, $payload));
+        [$callerClass, $callerId, $callerTransition, $callerAttempt] = $caller;
+        $outbox->add(new DeliverReply($callerClass, $callerId, $callerTransition, $callerAttempt, $payload));
     }
 
     /**
@@ -580,18 +579,146 @@ final readonly class SagaRunner
             . 'waits for an answer that will never come.', 0, $cause);
     }
 
+    /**
+     * Hands a child's answer to the {@see Call} that started it.
+     *
+     * Named, not matched by type. The runner knows which Call launched this child
+     * — it wrote the name into the child's history at birth — and routing by the
+     * payload's type instead threw that away, with two consequences. Two Calls
+     * awaiting the same type could not both exist, so N children of one kind was
+     * impossible. And an answer from an attempt the caller had already abandoned
+     * was applied to whatever wait was current, so a saga that gave up on a
+     * deadline, retried, and then heard from the abandoned child accepted that
+     * answer and moved on — while the child it was actually waiting for answered
+     * into nothing.
+     */
     private function deliver(DeliverReply $reply): void
     {
         $caller = $this->sagas->get($reply->callerClass);
 
-        try {
-            $this->signal($caller, $reply->callerId, $reply->payload);
-        } catch (SagaNotWaitingException) {
-            // The caller already consumed an answer and moved on. Answers are
-            // at-least-once, so this is the expected shape of a duplicate, not a
-            // fault. A caller that no longer exists is SignalOutcome::NotFound
-            // and already silent.
+        $dispatch = $this->lock->withLock(
+            $reply->callerId,
+            fn(): array => $this->answerExclusively($caller, $reply),
+        );
+
+        /** @var list<string> $dispatch */
+        $this->dispatch($caller, $reply->callerId, $dispatch);
+    }
+
+    /**
+     * Applies an answer to the exact Call that awaits it, or drops it.
+     *
+     * An answer is dropped, not refused, when the wait it belongs to is over: the
+     * caller is gone, or it has left the parking place, or it has come back to
+     * that place for a LATER attempt than this answer belongs to. Answers are
+     * at-least-once and a child may outlive the caller's patience, so a late one
+     * is the normal shape of the world rather than a fault — but it must not be
+     * mistaken for the answer to the wait now in progress.
+     *
+     * @return list<string> transitions to enqueue
+     */
+    private function answerExclusively(Saga $caller, DeliverReply $reply): array
+    {
+        $state = $this->repository->load($reply->callerId);
+        if ($state === null || in_array(self::ROLLBACK_FAILED, $state->history, true)) {
+            return [];
         }
+
+        $subject = $state->subject;
+        $workflow = $this->workflowFor($caller, $subject, $reply->callerId);
+        $this->assertMarkingStillFits($workflow, $state, $reply->callerId);
+        $this->markingStore->setMarking($subject, new Marking($state->marking));
+
+        $call = null;
+        foreach ($workflow->getEnabledTransitions($subject) as $transition) {
+            if ($transition instanceof Call && $transition->getName() === $reply->callerTransition) {
+                $call = $transition;
+                break;
+            }
+        }
+
+        if ($call === null) {
+            // The caller is not waiting on this Call any more.
+            return [];
+        }
+
+        $parking = null;
+        foreach ($call->getFroms() as $from) {
+            if (isset($state->marking[$from])) {
+                $parking = $from;
+                break;
+            }
+        }
+
+        if ($parking === null
+            || $this->timesEntered($workflow, $state->history, $parking) !== $reply->callerAttempt
+        ) {
+            // A different attempt's wait. Applying this would settle the current
+            // one with an answer from a child the caller has already written off.
+            return [];
+        }
+
+        // Which exit of the wait this answer takes. The Call names the answer it
+        // is for, so an answer of that type goes to the Call itself — by name,
+        // which is what lets two Calls await the same type and what keeps a
+        // stale answer off a live wait. Anything else is a different exit from
+        // the same place, an ordinary Signal for 'the attempt failed', and those
+        // are chosen by type as they always were.
+        $transition = $call->accepts($reply->payload)
+            ? $call->getName()
+            : $this->signalAccepting($workflow, $subject, $reply->payload, $reply->callerId);
+
+        if ($transition === null) {
+            return [];
+        }
+
+        [, $dispatch, $outbox] = $this->applyAndPersist(
+            $caller,
+            $reply->callerId,
+            $state,
+            $workflow,
+            $subject,
+            $transition,
+            [self::SIGNAL_CONTEXT_KEY => $reply->payload],
+        );
+
+        $this->perform($outbox);
+
+        return $dispatch;
+    }
+
+    /**
+     * The one enabled Signal that accepts $payload, for an answer the Call it came
+     * from does not await.
+     *
+     * Null when nothing does — the caller declared no exit for this outcome, which
+     * is its own graph's business — and an exception when several do, because
+     * guessing between them is worse than saying so.
+     */
+    private function signalAccepting(
+        WorkflowInterface $workflow,
+        object $subject,
+        object $payload,
+        string $sagaId,
+    ): ?string {
+        $matching = array_values(array_filter(
+            $this->enabledSignals($workflow, $subject),
+            static fn(Signal $signal): bool => $signal->accepts($payload),
+        ));
+
+        if ($matching === []) {
+            return null;
+        }
+
+        if (count($matching) > 1) {
+            $names = implode(', ', array_map(static fn(Signal $s): string => $s->getName(), $matching));
+            $payloadClass = $payload::class;
+
+            throw new SagaException("Saga '$sagaId' has more than one signal accepting a $payloadClass "
+                . "($names). Narrow their awaited types, or guard all but one of them.");
+        }
+
+        return $matching[0]->getName();
     }
 
     /**
@@ -609,7 +736,6 @@ final readonly class SagaRunner
      *                            one that obtained what the child needs.
      * @param  array<Transition>  $enabled  what is fireable from the new marking
      * @param  array<string>  $entered  the places this step just put a token in
-     * @param  array<string, int>  $marking  place => tokens, after the step
      * @param  array<string>  $history  including the step just applied
      */
     private function collectLaunches(
@@ -619,12 +745,9 @@ final readonly class SagaRunner
         WorkflowInterface $workflow,
         array $enabled,
         array $entered,
-        array $marking,
         array $history,
         SagaOutbox $outbox,
     ): void {
-        $launched = [];
-
         foreach ($enabled as $transition) {
             if (! $transition instanceof Call) {
                 continue;
@@ -644,9 +767,6 @@ final readonly class SagaRunner
                 // second child for one wait.
                 continue;
             }
-
-            $launched[$parking][] = $transition->getName();
-            $this->assertThePlaceCanAnswerThemAll($saga, $sagaId, $parking, $launched[$parking], $marking);
 
             $attempt = $this->timesEntered($workflow, $history, $parking);
             $childSubject = $transition->subjectFor($subject);
@@ -675,58 +795,6 @@ final readonly class SagaRunner
     private static function childId(string $parentId, string $transition, int $attempt): string
     {
         return $parentId.'/'.$transition.'/'.$attempt;
-    }
-
-    /**
-     * Refuses to start more children than a place can ever answer.
-     *
-     * Two Calls leaving one place LOOK like two parallel branches — in a dumped
-     * diagram they are two arrows out of one node — and they can never be. A
-     * place with several outgoing transitions is a choice: one token takes one of
-     * them, and firing the Call that answers first carries the token away, so the
-     * others lose their precondition for good. The picture promises parallelism
-     * the net does not deliver, and the difference is invisible until either the
-     * saga stalls at a join waiting for a token that will never arrive, or a child
-     * that ran to the end with all its side effects finds its answer unusable.
-     * Neither of those raises anything on its own. This does.
-     *
-     * Parallelism has a shape of its own, and the diagram shows which is which:
-     * branches come out of a TRANSITION, or the arc into their place carries a
-     * weight. Arrows out of a place are a choice. Both real forms are allowed
-     * here — a transition with several targets, one Call per branch; or one place
-     * holding as many tokens as it has live Calls.
-     *
-     * Checked when the launches are collected rather than when the definition is
-     * read, because only the marking and the guards can say which Calls are live.
-     * Two Calls out of one place with exclusive guards is a legitimate choice —
-     * this saga runs a card payment or a subscription payment — and refusing the
-     * definition would reject the shape instead of the fault.
-     *
-     * @param  list<string>  $live  the Calls collected for this place so far
-     * @param  array<string, int>  $marking  place => tokens
-     */
-    private function assertThePlaceCanAnswerThemAll(
-        Saga $saga,
-        string $sagaId,
-        string $place,
-        array $live,
-        array $marking,
-    ): void {
-        $tokens = $marking[$place] ?? 0;
-
-        if (count($live) <= $tokens) {
-            return;
-        }
-
-        $sagaClass = $saga::class;
-        $names = implode(', ', array_map(static fn(string $n): string => "'$n'", $live));
-
-        throw new SagaException("Saga '$sagaId' ($sagaClass) starts ".count($live).' children at once from place '
-            . "'$place' ($names), which holds $tokens token(s). These read as parallel branches but cannot be: a place "
-            . 'with several outgoing transitions is a choice, and the first answer carries the token away, so the rest '
-            . "can never fire — their children would run to the end for nothing, or a join would wait forever. Either "
-            . 'guard them to be exclusive, which is what a choice means, or express the parallelism: a transition with '
-            . 'one target per branch and a Call on each, or an arc weight giving this place a token per Call.');
     }
 
     /**
@@ -912,7 +980,6 @@ final readonly class SagaRunner
             $workflow,
             $enabled,
             $this->targetsOf($workflow, $transition),
-            $this->markingToArray($newMarking),
             $history,
             $outbox,
         );
@@ -1197,7 +1264,6 @@ final readonly class SagaRunner
         array $enabled,
     ): SagaOutbox {
         $outbox = new SagaOutbox();
-        $launched = [];
 
         foreach ($enabled as $transition) {
             if (! $transition instanceof Call) {
@@ -1214,9 +1280,6 @@ final readonly class SagaRunner
             if ($parking === null) {
                 continue;
             }
-
-            $launched[$parking][] = $transition->getName();
-            $this->assertThePlaceCanAnswerThemAll($saga, $sagaId, $parking, $launched[$parking], $state->marking);
 
             $attempt = $this->timesEntered($workflow, $state->history, $parking);
             $childSubject = $transition->subjectFor($state->subject);
