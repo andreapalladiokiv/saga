@@ -87,6 +87,12 @@ class Signal extends Transition
      *     $payment = Signal::payload($event, PaymentReceived::class);
      *     $payment->card;      // typed, checked
      *
+     * The channel is Symfony's APPLY CONTEXT, and it lasts exactly one apply():
+     * whatever a listener has to keep beyond the step — the card, the reference,
+     * the correlation — it folds into the subject, which is the only thing
+     * {@see SagaState} persists. Writing to the apply context to keep something is
+     * refused outright, because it used to look like it worked.
+     *
      * The union of event types is because every event Symfony dispatches during
      * an apply carries the context — `transition` and also `leave`, `enter`,
      * `entered`, `completed` and `announce` — but the trait providing

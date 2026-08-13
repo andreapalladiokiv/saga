@@ -206,6 +206,54 @@ final class SagaRunnerTest extends TestCase
         self::assertSame(['ready' => 1], $state->marking);
     }
 
+    // ───────────────── The apply context does not outlive the step ─────────────────
+
+    public function testAListenerWritingToTheApplyContextIsRefused(): void
+    {
+        // Symfony's apply context lives for exactly one apply(): marking stores
+        // are handed it and conventionally drop it, and SagaState has nowhere to
+        // put it. A listener that stashes a correlation there has code that looks
+        // right, tests green inside the step, and loses the data on the next one.
+        // Nothing announced that, so it is announced here.
+        $saga = $this->register(new Definition(
+            ['a', 'b'],
+            [new Transition('t1', 'a', 'b')],
+            ['a'],
+        ));
+        $this->onTransitionEvent($saga, 't1', static function (TransitionEvent $e): void {
+            $e->setContext(['payment_intent' => 'pi_123']);
+        });
+
+        $this->runner->start($saga, 'ctx-1', new TestSubject);
+        $msg = $this->queue->pop();
+
+        try {
+            $this->runner->run($saga, $msg['id'], $msg['transition']);
+            self::fail('writing to the apply context must not pass silently');
+        } catch (SagaException $e) {
+            self::assertStringContainsString('t1', $e->getMessage(), 'the transition must be named');
+            self::assertStringContainsString('payment_intent', $e->getMessage(), 'the key must be named');
+            self::assertStringContainsString('subject', $e->getMessage(), 'and where to put it instead');
+        }
+    }
+
+    public function testTheRunnersOwnApplyContextKeysAreNotMistakenForForeignOnes(): void
+    {
+        // The runner puts four keys in on every apply, so 'the context is not
+        // empty' is the normal case and cannot be the test.
+        $saga = $this->register(new Definition(
+            ['a', 'b'],
+            [new Transition('t1', 'a', 'b')],
+            ['a'],
+        ));
+
+        $this->runner->start($saga, 'ctx-2', new TestSubject);
+        $msg = $this->queue->pop();
+        $this->runner->run($saga, $msg['id'], $msg['transition']);
+
+        self::assertNull($this->repository->load('ctx-2'), 'an ordinary step is unaffected');
+    }
+
     // ───────────────── Mutual exclusion ─────────────────
 
     public function testTheTransitionActionRunsInsideTheSagaLockNotAroundIt(): void
@@ -1032,6 +1080,15 @@ final class SagaRunnerTest extends TestCase
         self::assertNotNull($msg, "expected a queued message for {$expected}");
         self::assertSame($expected, $msg['transition']);
         $this->runner->run($saga, $msg['id'], $msg['transition']);
+    }
+
+    /** Like onTransition(), but the listener receives the event itself. */
+    private function onTransitionEvent(Saga $saga, string $transition, callable $listener): void
+    {
+        $this->dispatcher->addListener(
+            sprintf('workflow.%s.transition.%s', $saga::class, $transition),
+            $listener,
+        );
     }
 
     private function onTransition(Saga $saga, string $transition, Closure $fn): void

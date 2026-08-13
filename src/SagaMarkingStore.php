@@ -34,7 +34,25 @@ final class SagaMarkingStore implements MarkingStoreInterface
     }
 
     /**
-     * @param  array<string, mixed>  $context
+     * Stores the marking, and deliberately drops $context.
+     *
+     * The argument is here because {@see MarkingStoreInterface} declares it, and
+     * it is discarded on purpose. Symfony's own marking stores discard it too, so
+     * the behaviour is conventional — but conventional and obvious are different
+     * things, and this one has caught the author of this package.
+     *
+     * $context is Symfony's APPLY CONTEXT: the array a caller passes to
+     * `Workflow::apply()` and that listeners can rewrite with
+     * `$event->setContext()`. It exists for the duration of one apply(). It is
+     * not a place to keep anything: {@see SagaState} persists marking, subject,
+     * history and version, and there is no fifth column for this, by choice —
+     * long-lived run state belongs on the SUBJECT, and a second home for the same
+     * fact only raises the question of which of the two is right.
+     *
+     * A listener that writes to it anyway is refused rather than quietly ignored;
+     * see {@see SagaRunner::assertNothingWasStashedInTheApplyContext()}.
+     *
+     * @param  array<string, mixed>  $context  Symfony's per-apply context; discarded
      */
     public function setMarking(object $subject, Marking $marking, array $context = []): void
     {

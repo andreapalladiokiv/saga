@@ -16,12 +16,14 @@ use Throwable;
 
 use const JSON_THROW_ON_ERROR;
 
+use function array_diff;
 use function array_fill_keys;
 use function array_keys;
 use function array_map;
 use function array_unique;
 use function array_values;
 use function count;
+use function implode;
 use function in_array;
 use function is_string;
 use function json_decode;
@@ -819,12 +821,14 @@ final readonly class SagaRunner
 
         // The id, the outbox and the caller go in for every apply, not just a
         // signal's. Listed first so a caller's own context wins on a key clash.
-        $workflow->apply($subject, $transition, [
+        $applied = $workflow->apply($subject, $transition, [
             self::SAGA_ID_CONTEXT_KEY => $sagaId,
             self::OUTBOX_CONTEXT_KEY => $outbox,
             self::CALLER_CONTEXT_KEY => $this->callerOf($state),
             ...$context,
         ]);
+
+        $this->assertNothingWasStashedInTheApplyContext($applied, $sagaId, $transition);
 
         $newMarking = $this->markingStore->getMarking($subject);
         $history = [...$state->history, $transition];
@@ -1250,6 +1254,60 @@ final readonly class SagaRunner
             }
             $seen[$name] = true;
         }
+    }
+
+    /**
+     * Refuses a step whose listener wrote to Symfony's apply context.
+     *
+     * The apply context lives for exactly one apply() and then goes. Symfony
+     * hands it to the marking store, whose own implementations drop it and so
+     * does {@see SagaMarkingStore}; {@see SagaState} has no field for it. So a
+     * listener that stashes a correlation there — a payment intent id to
+     * remember which other saga this run belongs to — writes code that looks
+     * right, tests green within the step, and has lost the value by the next one.
+     * Nothing announced that, which is the entire reason this check exists.
+     *
+     * Detection is by FOREIGN KEYS, not by the context being non-empty: the
+     * runner puts four of its own in on every apply, so a populated apply
+     * context is the normal case. Anything else can only have arrived through
+     * `$event->setContext()`.
+     *
+     * Note what a listener calling setContext() actually does: Event::setContext()
+     * replaces the array wholesale, so it does not merely add a key — it also
+     * throws away the runner's own four, and with them the payload
+     * {@see Signal::payload()} reads and the outbox {@see reply()} writes to. All
+     * the more reason to be loud.
+     *
+     * Long-lived run state belongs in the subject, which is the one thing that
+     * does survive a step, and which is why there is deliberately no second place
+     * for it: two homes for the same fact raise the question of which one is
+     * right.
+     */
+    private function assertNothingWasStashedInTheApplyContext(
+        Marking $applied,
+        string $sagaId,
+        string $transition,
+    ): void {
+        $foreign = array_values(array_diff(
+            array_keys($applied->getContext() ?? []),
+            [
+                self::SAGA_ID_CONTEXT_KEY,
+                self::OUTBOX_CONTEXT_KEY,
+                self::CALLER_CONTEXT_KEY,
+                self::SIGNAL_CONTEXT_KEY,
+            ],
+        ));
+
+        if ($foreign === []) {
+            return;
+        }
+
+        throw new SagaException("Transition '$transition' of saga '$sagaId' wrote ".implode(', ', array_map(
+            static fn(string $key): string => "'$key'",
+            $foreign,
+        )).' to the apply context. That context lasts for one apply() and is then dropped — nothing '
+            . 'persists it, so the value would be gone by the next step. Put anything that has to outlive '
+            . 'the step on the subject instead, which is what SagaState stores.');
     }
 
     /**
