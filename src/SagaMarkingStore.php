@@ -37,17 +37,26 @@ final class SagaMarkingStore implements MarkingStoreInterface
      * Stores the marking, and deliberately drops $context.
      *
      * The argument is here because {@see MarkingStoreInterface} declares it, and
-     * it is discarded on purpose. Symfony's own marking stores discard it too, so
-     * the behaviour is conventional — but conventional and obvious are different
-     * things, and this one has caught the author of this package.
+     * it is discarded because there is nowhere for it to go.
+     *
+     * What Symfony means it for is worth knowing, since it is not simply ignored
+     * upstream: {@see \Symfony\Component\Workflow\MarkingStore\MethodMarkingStore}
+     * forwards it to the subject's own marking setter, so a domain object exposing
+     * `setMarking(string|array|\BackedEnum $places, array $context = [])` receives
+     * the apply-time metadata and may record who moved it and why. Only the method
+     * accessor gets it; the property accessor drops it.
+     *
+     * That door does not exist here. This store keeps the marking in a
+     * {@see WeakMap} precisely so subjects stay plain DTOs with no marking
+     * property and no setter to call — so there is no setter to hand $context to.
      *
      * $context is Symfony's APPLY CONTEXT: the array a caller passes to
      * `Workflow::apply()` and that listeners can rewrite with
-     * `$event->setContext()`. It exists for the duration of one apply(). It is
-     * not a place to keep anything: {@see SagaState} persists marking, subject,
-     * history and version, and there is no fifth column for this, by choice —
-     * long-lived run state belongs on the SUBJECT, and a second home for the same
-     * fact only raises the question of which of the two is right.
+     * `$event->setContext()`. It exists for the duration of one apply(), and it is
+     * handed over here mid-apply — before `entered`, `completed` and `announce` —
+     * so it is not even the final value. It is not a place to keep anything:
+     * {@see SagaState} persists marking, subject, history and version, and
+     * long-lived run state belongs on the SUBJECT.
      *
      * A listener that writes to it anyway is refused rather than quietly ignored;
      * see {@see SagaRunner::assertNothingWasStashedInTheApplyContext()}.

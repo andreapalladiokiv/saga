@@ -17,20 +17,14 @@ namespace Techork\Saga;
  *             reverse-order compensation when a later transition fails
  *  - version: monotonically-incremented on every save. Repositories that need
  *             optimistic locking compare-and-set on this value.
- *  - pending: transitions the runner has already put on the queue and not yet
- *             seen applied. This is what stops a completing fork branch from
- *             re-queueing its still-in-flight siblings. It records what was
- *             *dispatched*, not what happens to be enabled — a saga can sit in
- *             a wait state with transitions enabled and nothing dispatched, and
- *             those must be queued once a guard finally passes.
- *  - status:  {@see SagaStatus}. Separates a saga that is still moving from one
- *             whose rollback failed and now needs a human.
- *  - sagaClass: which {@see Saga} this row belongs to. Without it the class lived
- *             only in the queue message, so a dropped message left a row nothing
- *             could identify, let alone resume — every entry point needs a Saga
- *             the row could not supply.
  *
- * @property-read class-string<Saga>|null $sagaClass
+ * That is the whole row, and the absences are deliberate. There is no status
+ * field: moving, parked and stalled are all derived from the definition and the
+ * marking — parked means everything fireable is a {@see Signal}. There is no
+ * record of what has been dispatched: duplicates are made harmless by the saga
+ * lock plus the can() check, so tracking them would buy job count, not
+ * correctness. And a rollback that did not finish is journalled into `history`
+ * under {@see SagaRunner::ROLLBACK_FAILED} rather than given a column of its own.
  */
 final readonly class SagaState
 {
