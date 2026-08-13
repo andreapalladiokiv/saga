@@ -30,13 +30,31 @@ use Symfony\Component\Workflow\Arc;
  * straight back for the first — two sagas, two locks, a cycle. Declaring the
  * relationship instead of coding it removes the opportunity.
  *
- * The child's id is derived, never supplied: `<parent id>/<transition>/<n>`,
- * where n counts how many times the parent has entered this place — a retry
- * loop that comes back for a second payment attempt gets a second child rather
- * than colliding with the first. Because the id is derivable, a launch lost to a
- * crash is re-derivable too: {@see SagaRunner::requeue()} recreates a child that
- * a parked parent is waiting for, and hitting
- * {@see SagaAlreadyExistsException} means it was already there.
+ * The child's id is derived rather than supplied at the call site. By default
+ * `<parent id>/<transition>/<n>`, where n counts how many times the parent has
+ * entered this place, so a retry loop that comes back for a second payment
+ * attempt gets a second child instead of colliding with the first.
+ *
+ * That default is opaque, which is a problem when something outside has to find
+ * the child later — an endpoint capturing a payment, a provider's webhook. Pass
+ * {@see $id} to derive it from the child's own subject instead:
+ *
+ *     id: static fn (PaymentIntentSubject $s, int $attempt): string
+ *         => "pi-{$s->reference}-{$attempt}",
+ *
+ * Derived is the load-bearing word either way: the rule is a pure function of
+ * the child's subject, so {@see SagaRunner::requeue()} recomputes the same id
+ * and can recreate a child that a parked parent is waiting for but which a
+ * crash lost before it was started.
+ *
+ * A rule that ignores $attempt is safe only while each child finishes before the
+ * next attempt starts; reusing the name of a saga that has ended is fine. It is
+ * not safe when the caller moves on while the child is still running — a
+ * deadline rather than an answer — and there the runner refuses instead of
+ * guessing: it records which attempt each child belongs to, and a launch landing
+ * on a row belonging to a different one is an error. Swallowing it would let the
+ * retry adopt the earlier child, launch nothing, and leave that child's answer
+ * arriving for an attempt that no longer exists.
  *
  * A place may have at most one Call leaving it — two would launch two children
  * on one entry. Other exits from the same place are ordinary Signals (the
@@ -53,6 +71,8 @@ final class Call extends Signal
      * @param  class-string<Saga>  $runs  the saga to launch on entering the parking place
      * @param  class-string  $awaits  the answer type this Call accepts
      * @param  Closure(object): object  $subject  builds the child's subject from the parent's
+     * @param  Closure(object, int): string|null  $id  names the child from its own subject and the
+     *                                                 attempt number; omit for the default
      */
     public function __construct(
         string $name,
@@ -61,6 +81,7 @@ final class Call extends Signal
         public readonly string $runs,
         string $awaits,
         public readonly Closure $subject,
+        public readonly ?Closure $id = null,
     ) {
         parent::__construct($name, $froms, $tos, $awaits);
     }
@@ -69,5 +90,17 @@ final class Call extends Signal
     public function subjectFor(object $parentSubject): object
     {
         return ($this->subject)($parentSubject);
+    }
+
+    /**
+     * The child's id under this Call's own rule, or null to use the runner's.
+     *
+     * Takes the child's subject rather than the parent's: what an outside caller
+     * later looks the child up by — a payment intent reference, an invoice
+     * number — belongs to the child.
+     */
+    public function idFor(object $childSubject, int $attempt): ?string
+    {
+        return $this->id === null ? null : ($this->id)($childSubject, $attempt);
     }
 }

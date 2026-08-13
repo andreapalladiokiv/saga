@@ -528,15 +528,52 @@ final readonly class SagaRunner
             $launch->callerClass,
             $launch->callerId,
             $launch->callerTransition,
+            $launch->callerAttempt,
         ], JSON_THROW_ON_ERROR);
 
         try {
             $this->startSeeded($child, $launch->childId, $launch->subject, [$caller]);
-        } catch (SagaAlreadyExistsException) {
-            // The child is already there: the step was redelivered, or the
-            // recovery sweep got here first. The id is derived precisely so this
-            // is a no-op rather than a second child.
+        } catch (SagaAlreadyExistsException $e) {
+            $this->assertTheExistingChildIsThisOne($launch, $e);
         }
+    }
+
+    /**
+     * Decides whether a launch that found the id taken is harmless.
+     *
+     * It is when the row is this very launch arriving twice — a redelivered step,
+     * or the recovery sweep having got there first. The id is derived precisely
+     * so that is a no-op rather than a second child.
+     *
+     * It is not when the row belongs to a different attempt of the same Call,
+     * which is what a {@see Call::$id} rule that ignores its $attempt argument
+     * produces. Swallowing that would be the worst possible outcome: the second
+     * attempt would quietly adopt the first attempt's finished child, no launch
+     * would happen, and the parent would wait for an answer nobody is going to
+     * send. Nor when the row is some unrelated saga that happens to share the id.
+     */
+    private function assertTheExistingChildIsThisOne(LaunchChild $launch, SagaAlreadyExistsException $cause): void
+    {
+        $existing = $this->repository->load($launch->childId);
+        $caller = $existing === null ? null : $this->callerOf($existing);
+
+        if ($caller !== null
+            && $caller[0] === $launch->callerClass
+            && $caller[1] === $launch->callerId
+            && $caller[2] === $launch->callerTransition
+            && $caller[3] === $launch->callerAttempt
+        ) {
+            return;
+        }
+
+        $owner = $caller === null
+            ? 'a saga that no Call started'
+            : "attempt {$caller[3]} of '{$caller[2]}' in {$caller[0]}#{$caller[1]}";
+
+        throw new SagaException("Cannot start '{$launch->childId}' for attempt {$launch->callerAttempt} of "
+            . "'{$launch->callerTransition}': that id already belongs to $owner. A ".Call::class.' id rule must '
+            . 'vary by its $attempt argument, or every retry reuses the first attempt\'s child and the caller '
+            . 'waits for an answer that will never come.', 0, $cause);
     }
 
     private function deliver(DeliverReply $reply): void
@@ -600,17 +637,17 @@ final readonly class SagaRunner
                 continue;
             }
 
+            $attempt = $this->timesEntered($workflow, $history, $parking);
+            $childSubject = $transition->subjectFor($subject);
+
             $outbox->add(new LaunchChild(
                 $transition->runs,
-                self::childId(
-                    $sagaId,
-                    $transition->getName(),
-                    $this->timesEntered($workflow, $history, $parking),
-                ),
-                $transition->subjectFor($subject),
+                $this->childIdFor($transition, $sagaId, $childSubject, $attempt),
+                $childSubject,
                 $saga::class,
                 $sagaId,
                 $transition->getName(),
+                $attempt,
             ));
         }
     }
@@ -627,6 +664,20 @@ final readonly class SagaRunner
     private static function childId(string $parentId, string $transition, int $attempt): string
     {
         return $parentId.'/'.$transition.'/'.$attempt;
+    }
+
+    /**
+     * The child's id: the Call's own rule when it declares one, else the
+     * runner's.
+     *
+     * Either way it is a pure function of things that do not change while the
+     * parent is parked, which is what lets {@see missingChildren()} ask whether
+     * the child exists at all.
+     */
+    private function childIdFor(Call $call, string $parentId, object $childSubject, int $attempt): string
+    {
+        return $call->idFor($childSubject, $attempt)
+            ?? self::childId($parentId, $call->getName(), $attempt);
     }
 
     /**
@@ -678,7 +729,7 @@ final readonly class SagaRunner
     /**
      * Who called this saga, if a {@see Call} did.
      *
-     * @return array{class-string<Saga>, string, string}|null
+     * @return array{class-string<Saga>, string, string, int}|null class, id, the Call's name, the attempt
      */
     private function callerOf(SagaState $state): ?array
     {
@@ -687,7 +738,7 @@ final readonly class SagaRunner
                 continue;
             }
 
-            /** @var array{class-string<Saga>, string, string} $caller */
+            /** @var array{class-string<Saga>, string, string, int} $caller */
             $caller = json_decode(substr($entry, strlen(self::CALLER)), true, 512, JSON_THROW_ON_ERROR);
 
             return $caller;
@@ -1089,11 +1140,10 @@ final readonly class SagaRunner
                 continue;
             }
 
-            $childId = self::childId(
-                $sagaId,
-                $transition->getName(),
-                $this->timesEntered($workflow, $state->history, $parking),
-            );
+            $attempt = $this->timesEntered($workflow, $state->history, $parking);
+            $childSubject = $transition->subjectFor($state->subject);
+            $childId = $this->childIdFor($transition, $sagaId, $childSubject, $attempt);
+
             if ($this->repository->load($childId) !== null) {
                 continue;
             }
@@ -1101,10 +1151,11 @@ final readonly class SagaRunner
             $outbox->add(new LaunchChild(
                 $transition->runs,
                 $childId,
-                $transition->subjectFor($state->subject),
+                $childSubject,
                 $saga::class,
                 $sagaId,
                 $transition->getName(),
+                $attempt,
             ));
         }
 
