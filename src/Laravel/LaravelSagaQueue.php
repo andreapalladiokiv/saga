@@ -34,8 +34,14 @@ final class LaravelSagaQueue implements SagaQueue
 
         $saga = $this->container->make($sagaClass);
 
-        $connection = ($saga instanceof SagaRouting ? $saga->connection() : null) ?? $this->connection;
-        $queue = ($saga instanceof SagaRouting ? $saga->queue() : null) ?? $this->queue;
+        // [null, null] rather than [], or destructuring a saga that does not route
+        // reads offsets that are not there — two warnings a strict phpunit turns
+        // into a failure, and the routing silently falls back either way.
+        [$connection, $queue] = $saga instanceof SagaRouting
+            ? [$saga->connection(), $saga->queue()]
+            : [null, null];
+        $connection ??= $this->connection;
+        $queue ??= $this->queue;
 
         if ($connection !== null) {
             $job->onConnection($connection);

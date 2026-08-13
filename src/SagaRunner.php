@@ -25,6 +25,7 @@ use function array_values;
 use function count;
 use function implode;
 use function in_array;
+use function is_array;
 use function is_string;
 use function json_decode;
 use function max;
@@ -124,6 +125,18 @@ final readonly class SagaRunner
     private const CALLER_CONTEXT_KEY = 'saga.caller';
 
     /**
+     * Where the apply context carries the child ids this saga has handed out, for
+     * {@see childId()}.
+     *
+     * A generated id has to reach the steps that come after the launch — the one
+     * that captures the payment, the one that answers a webhook about it — and
+     * that is a step boundary, which is a process boundary. The runner already
+     * writes the id down when it hands it out; this passes the record along rather
+     * than making every caller keep its own copy of what the engine knows.
+     */
+    private const CHILD_CONTEXT_KEY = 'saga.children';
+
+    /**
      * Journalled into `history` at birth when a {@see Call} started this saga,
      * carrying the caller's class, id and the Call's name.
      *
@@ -133,6 +146,33 @@ final readonly class SagaRunner
      * the id format load-bearing, and ids are the user's in every other case.
      */
     private const CALLER = '!saga:caller:';
+
+    /**
+     * Journalled into the CALLER's `history` when a {@see Call} launches a child,
+     * recording which id that Call's attempt was given.
+     *
+     * Written because a {@see Call::$id} rule generates: uuid7, a provider's
+     * reference. A generated value cannot be recomputed, so recovery that tried
+     * to would never recognise the child it was looking for and would create
+     * another one every sweep.
+     *
+     * Which makes the distinction the rule has to respect a matter of attempts.
+     * A TECHNICAL retry — a redelivered job, a sweep after a lost hand-off, a
+     * crash between the commit and the launch — is the same wait being redriven,
+     * so it must reuse the same child. A BUSINESS retry — the intent declined and
+     * the saga decided to pay again — re-enters the parking place, so it is a new
+     * wait and must have a new child, or the second attempt collides with the
+     * first at the provider. The engine already tells them apart: a technical
+     * retry leaves history untouched and so keeps the same attempt number, while
+     * a business retry adds to it. So the id rule is called exactly once per
+     * attempt and the answer kept here, keyed by the Call and that number.
+     *
+     * In `history` rather than a column of its own: the row already carries this
+     * column, the '!saga:' prefix is already reserved for the runner's own
+     * journal, and the write lands in the same save as the step that decided to
+     * launch — so a step that never commits records nothing.
+     */
+    private const CHILD = '!saga:child:';
 
     public function __construct(
         private SagaStateRepository      $repository,
@@ -217,9 +257,17 @@ final readonly class SagaRunner
         // later step. Collected BEFORE the row is written, so a saga the runner
         // refuses leaves nothing behind.
         $outbox = new SagaOutbox();
-        $this->collectLaunches($saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial, $history, $outbox);
+        $journal = $this->collectLaunches(
+            $saga, $sagaId, $subject, $workflow, $enabledTransitions, $initial, $history, $outbox,
+        );
 
-        $state = new SagaState($sagaId, $this->markingToArray($marking), $subject, $history, version: 1);
+        $state = new SagaState(
+            $sagaId,
+            $this->markingToArray($marking),
+            $subject,
+            [...$history, ...$journal],
+            version: 1,
+        );
         $this->repository->save($state);
 
         return [$state, $enabled, $outbox];
@@ -471,6 +519,52 @@ final readonly class SagaRunner
 
         [$callerClass, $callerId, $callerTransition, $callerAttempt] = $caller;
         $outbox->add(new DeliverReply($callerClass, $callerId, $callerTransition, $callerAttempt, $payload));
+    }
+
+    /**
+     * The id of the child a {@see Call} launched, for a step that runs after the
+     * launch.
+     *
+     * The id is generated once, when the Call hands it out, and written down; this
+     * reads that record. So the step that captures the payment, or the endpoint
+     * answering a webhook about it, can name the child without the launching step
+     * having copied the value into the subject on its way past.
+     *
+     *     $intentId = SagaRunner::childId($event, 'pay');
+     *
+     * The latest attempt's, because that is the one in progress: a business retry
+     * hands out a new id, and the previous attempt's child is done with.
+     *
+     * @param  Event<object>  $event
+     */
+    public static function childId(Event $event, string $call): ?string
+    {
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
+        $children = $context[self::CHILD_CONTEXT_KEY] ?? [];
+
+        return is_array($children) && is_string($children[$call] ?? null) ? $children[$call] : null;
+    }
+
+    /**
+     * Every Call's latest child id, read out of the row's own journal.
+     *
+     * @return array<string, string> the Call's name => the child's id
+     */
+    private function childrenOf(SagaState $state): array
+    {
+        $children = [];
+
+        foreach ($state->history as $entry) {
+            if (! str_starts_with($entry, self::CHILD)) {
+                continue;
+            }
+
+            /** @var array{string, int, string} $record */
+            $record = json_decode(substr($entry, strlen(self::CHILD)), true, 512, JSON_THROW_ON_ERROR);
+            $children[$record[0]] = $record[2];
+        }
+
+        return $children;
     }
 
     /**
@@ -737,6 +831,7 @@ final readonly class SagaRunner
      * @param  array<Transition>  $enabled  what is fireable from the new marking
      * @param  array<string>  $entered  the places this step just put a token in
      * @param  array<string>  $history  including the step just applied
+     * @return list<string> journal entries the caller must save with the step
      */
     private function collectLaunches(
         Saga $saga,
@@ -747,7 +842,9 @@ final readonly class SagaRunner
         array $entered,
         array $history,
         SagaOutbox $outbox,
-    ): void {
+    ): array {
+        $journal = [];
+
         foreach ($enabled as $transition) {
             if (! $transition instanceof Call) {
                 continue;
@@ -771,9 +868,18 @@ final readonly class SagaRunner
             $attempt = $this->timesEntered($workflow, $history, $parking);
             $childSubject = $transition->subjectFor($subject);
 
+            $childId = $this->recordedChildId($history, $transition->getName(), $attempt);
+            if ($childId === null) {
+                $childId = $this->childIdFor($transition, $sagaId, $childSubject, $attempt);
+                $journal[] = self::CHILD.json_encode(
+                    [$transition->getName(), $attempt, $childId],
+                    JSON_THROW_ON_ERROR,
+                );
+            }
+
             $outbox->add(new LaunchChild(
                 $transition->runs,
-                $this->childIdFor($transition, $sagaId, $childSubject, $attempt),
+                $childId,
                 $childSubject,
                 $saga::class,
                 $sagaId,
@@ -781,6 +887,31 @@ final readonly class SagaRunner
                 $attempt,
             ));
         }
+
+        return $journal;
+    }
+
+    /**
+     * The id a Call's attempt was already given, if it was.
+     *
+     * @param  array<string>  $history
+     */
+    private function recordedChildId(array $history, string $transition, int $attempt): ?string
+    {
+        foreach ($history as $entry) {
+            if (! str_starts_with($entry, self::CHILD)) {
+                continue;
+            }
+
+            /** @var array{string, int, string} $record */
+            $record = json_decode(substr($entry, strlen(self::CHILD)), true, 512, JSON_THROW_ON_ERROR);
+
+            if ($record[0] === $transition && $record[1] === $attempt) {
+                return $record[2];
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -792,7 +923,7 @@ final readonly class SagaRunner
      * commit and {@see perform()} is recoverable: {@see requeue()} recomputes the
      * same id and creates what is missing.
      */
-    private static function childId(string $parentId, string $transition, int $attempt): string
+    private static function defaultChildId(string $parentId, string $transition, int $attempt): string
     {
         return $parentId.'/'.$transition.'/'.$attempt;
     }
@@ -808,7 +939,7 @@ final readonly class SagaRunner
     private function childIdFor(Call $call, string $parentId, object $childSubject, int $attempt): string
     {
         return $call->idFor($childSubject, $attempt)
-            ?? self::childId($parentId, $call->getName(), $attempt);
+            ?? self::defaultChildId($parentId, $call->getName(), $attempt);
     }
 
     /**
@@ -962,6 +1093,7 @@ final readonly class SagaRunner
             self::SAGA_ID_CONTEXT_KEY => $sagaId,
             self::OUTBOX_CONTEXT_KEY => $outbox,
             self::CALLER_CONTEXT_KEY => $this->callerOf($state),
+            self::CHILD_CONTEXT_KEY => $this->childrenOf($state),
             ...$context,
         ]);
 
@@ -973,7 +1105,7 @@ final readonly class SagaRunner
 
         // Entering a place a Call leaves is what launches that Call's saga. The
         // places just entered are the applied transition's own targets.
-        $this->collectLaunches(
+        $history = [...$history, ...$this->collectLaunches(
             $saga,
             $sagaId,
             $subject,
@@ -982,7 +1114,7 @@ final readonly class SagaRunner
             $this->targetsOf($workflow, $transition),
             $history,
             $outbox,
-        );
+        )];
 
         // Terminal: nothing enabled and nothing structurally outgoing. The saga
         // reached a place that accepts no further moves — clean up and exit.
@@ -1283,7 +1415,13 @@ final readonly class SagaRunner
 
             $attempt = $this->timesEntered($workflow, $state->history, $parking);
             $childSubject = $transition->subjectFor($state->subject);
-            $childId = $this->childIdFor($transition, $sagaId, $childSubject, $attempt);
+
+            // The recorded id, never a fresh one: this is the technical-retry path,
+            // and minting here is what turned one payment into a payment per sweep.
+            // Nothing recorded means the launch was never collected, so falling
+            // back to the rule is the first mint rather than a second.
+            $childId = $this->recordedChildId($state->history, $transition->getName(), $attempt)
+                ?? $this->childIdFor($transition, $sagaId, $childSubject, $attempt);
 
             if ($this->repository->load($childId) !== null) {
                 continue;
@@ -1431,6 +1569,7 @@ final readonly class SagaRunner
                 self::SAGA_ID_CONTEXT_KEY,
                 self::OUTBOX_CONTEXT_KEY,
                 self::CALLER_CONTEXT_KEY,
+                self::CHILD_CONTEXT_KEY,
                 self::SIGNAL_CONTEXT_KEY,
             ],
         ));

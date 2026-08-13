@@ -6,11 +6,14 @@ namespace Techork\Saga\Tests;
 
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\EventDispatcher\EventDispatcher;
+use Symfony\Component\Workflow\Definition;
 use Symfony\Component\Workflow\Event\GuardEvent;
 use Symfony\Component\Workflow\Event\TransitionEvent;
 use Symfony\Component\Workflow\Registry;
 use Symfony\Component\Workflow\SupportStrategy\InstanceOfSupportStrategy;
+use Symfony\Component\Workflow\Transition;
 use Symfony\Component\Workflow\Workflow;
+use Techork\Saga\Call;
 use Techork\Saga\InMemorySagaStateRepository;
 use Techork\Saga\InProcessSagaLock;
 use Techork\Saga\Saga;
@@ -30,6 +33,8 @@ use Techork\Saga\Tests\Call\PaymentDeclined;
 use Techork\Saga\Tests\Call\PaymentIntentSaga;
 use Techork\Saga\Tests\Call\PaymentIntentSubject;
 
+use function bin2hex;
+use function random_bytes;
 use function sprintf;
 
 /**
@@ -154,6 +159,118 @@ final class CallIdTest extends TestCase
 
         self::assertNull($this->repository->load('chk-1'), 'the checkout ran on to the end');
     }
+
+    public function testAGeneratedChildIdIsRecordedSoRecoveryDoesNotSpawnDuplicates(): void
+    {
+        // A real id rule generates — uuid7, a provider's reference — and a
+        // generated value cannot be recomputed. Recovery that recomputes would
+        // therefore never find the child it is looking for and would create
+        // another one every sweep: four payment intents for one payment.
+        $saga = new class implements Saga
+        {
+            public function definition(): Definition
+            {
+                return new Definition(['new', 'paying', 'paid'], [
+                    new Transition('open', 'new', 'paying'),
+                    new Call('pay', 'paying', 'paid',
+                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
+                        subject: static fn (CheckoutSubject $s): object
+                            => new PaymentIntentSubject($s->orderId, $s->amount),
+                        id: static fn (PaymentIntentSubject $s, int $attempt): string
+                            => 'pi_'.bin2hex(random_bytes(8))),
+                ], ['new']);
+            }
+        };
+        $this->boot($saga);
+
+        // every child announces itself as it is created, so no reflection is
+        // needed to count them
+        $born = [];
+        $this->dispatcher->addListener(sprintf('workflow.%s.transition.create', PaymentIntentSaga::class),
+            static function (TransitionEvent $e) use (&$born): void {
+                $born[] = SagaRunner::sagaId($e);
+            });
+
+        $this->runner->start($saga, 'chk-g', new CheckoutSubject('ord-g', '49.99'));
+        self::assertCount(1, $born, 'one child at launch');
+
+        $this->runner->requeue($saga, 'chk-g');
+        $this->runner->requeue($saga, 'chk-g');
+
+        self::assertCount(1, $born,
+            'the sweep must find the child it already has, not generate another id');
+    }
+
+    public function testALaterStepCanReadTheGeneratedChildId(): void
+    {
+        // The point of writing the id down: the step that captures the payment,
+        // or an endpoint answering a webhook about it, needs to name the child —
+        // and that is a different step, which is a different process. Nothing has
+        // to be copied into the subject on the way past.
+        $saga = new NamedCallSaga;
+        $this->boot($saga);
+
+        $seen = null;
+        $this->dispatcher->addListener(sprintf('workflow.%s.transition.settle', NamedCallSaga::class),
+            static function (TransitionEvent $e) use (&$seen): void {
+                $seen = SagaRunner::childId($e, 'pay');
+            });
+
+        $this->runner->start($saga, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+        $this->runner->signal($this->intent, 'pi-ord-1-1', new ChallengePassed('auth-9'));
+
+        self::assertSame('pi-ord-1-1', $seen, 'the step after the launch reads the id the engine handed out');
+    }
+
+    public function testABusinessRetryGetsAFreshGeneratedIdWhileATechnicalOneDoesNot(): void
+    {
+        // The distinction the engine has to respect. A technical retry is the same
+        // wait redriven and must reuse the child; a business retry is a new wait —
+        // the intent declined and the saga decided to pay again — and must have a
+        // new one, or the second attempt collides with the first at the provider.
+        // Attempts tell them apart: only a business retry adds to history.
+        $saga = new class implements Saga
+        {
+            public function definition(): Definition
+            {
+                return new Definition(['new', 'paying', 'paid', 'declined'], [
+                    new Transition('open', 'new', 'paying'),
+                    new Call('pay', 'paying', 'paid',
+                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
+                        subject: static fn (CheckoutSubject $s): object
+                            => new PaymentIntentSubject($s->orderId, $s->amount),
+                        id: static fn (PaymentIntentSubject $s, int $attempt): string
+                            => 'pi_'.bin2hex(random_bytes(8))),
+                    new Signal('payment_declined', 'paying', 'declined', awaits: PaymentDeclined::class),
+                    new Transition('retry', 'declined', 'paying'),
+                ], ['new']);
+            }
+        };
+        $this->boot($saga);
+
+        $born = [];
+        $this->dispatcher->addListener(sprintf('workflow.%s.transition.create', PaymentIntentSaga::class),
+            static function (TransitionEvent $e) use (&$born): void {
+                $born[] = SagaRunner::sagaId($e);
+            });
+
+        $this->runner->start($saga, 'chk-b', new CheckoutSubject('ord-b', '49.99'));
+        self::assertCount(1, $born);
+        $firstChild = $born[0];
+
+        // technical: the sweep redrives the same wait
+        $this->runner->requeue($saga, 'chk-b');
+        self::assertCount(1, $born, 'a technical retry reuses the child');
+
+        // business: the intent declines and the saga pays again
+        $this->runner->signal($this->intent, $firstChild, new ChallengeFailed('no funds'));
+        $this->allowRetry = true;
+        $this->runner->run($saga, 'chk-b', 'retry');
+
+        self::assertCount(2, $born, 'a business retry gets a child of its own');
+        self::assertNotSame($firstChild, $born[1], 'and a freshly generated id');
+    }
+
 
     public function testRequeueRecomputesTheSameNameAndRecreatesAMissingChild(): void
     {
