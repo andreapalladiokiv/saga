@@ -433,7 +433,8 @@ final class CallTest extends TestCase
             self::fail('more live Calls than the place has tokens must be refused');
         } catch (SagaException $e) {
             self::assertStringContainsString("place 'a'", $e->getMessage());
-            self::assertStringContainsString("holds 1 token", $e->getMessage());
+            self::assertStringContainsString('holds 1 token', $e->getMessage());
+            self::assertStringContainsString('choice', $e->getMessage(), 'the message must name what the shape is');
             self::assertStringContainsString("'one'", $e->getMessage());
             self::assertStringContainsString("'two'", $e->getMessage());
         }

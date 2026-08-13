@@ -680,24 +680,27 @@ final readonly class SagaRunner
     /**
      * Refuses to start more children than a place can ever answer.
      *
-     * Several Calls may leave one place. Which of them is live is a question only
-     * the marking and the guards can answer, so this is checked when the launches
-     * are collected and not when the definition is read — a static check over the
-     * definition rejects the shape, and the shape is legitimate: two Calls out of
-     * one place, guarded to be exclusive, is how a saga chooses WHICH saga to run
-     * from what it knows.
+     * Two Calls leaving one place LOOK like two parallel branches — in a dumped
+     * diagram they are two arrows out of one node — and they can never be. A
+     * place with several outgoing transitions is a choice: one token takes one of
+     * them, and firing the Call that answers first carries the token away, so the
+     * others lose their precondition for good. The picture promises parallelism
+     * the net does not deliver, and the difference is invisible until either the
+     * saga stalls at a join waiting for a token that will never arrive, or a child
+     * that ran to the end with all its side effects finds its answer unusable.
+     * Neither of those raises anything on its own. This does.
      *
-     * What is not legitimate is more live Calls than the place has tokens. A
-     * Call's answer fires that Call, and firing it consumes a token from the
-     * place; so a place holding one token can see exactly one of its Calls
-     * through, and any further child would run to the end, with whatever side
-     * effects it has, and find its answer unusable. Note that this is the net's
-     * arithmetic and not a rule of this package: a place with several outgoing
-     * transitions is a CHOICE, and one token can only take one of them.
+     * Parallelism has a shape of its own, and the diagram shows which is which:
+     * branches come out of a TRANSITION, or the arc into their place carries a
+     * weight. Arrows out of a place are a choice. Both real forms are allowed
+     * here — a transition with several targets, one Call per branch; or one place
+     * holding as many tokens as it has live Calls.
      *
-     * A genuine fork is a transition with several targets, one Call per branch —
-     * different places, so nothing here objects. A place carrying two tokens can
-     * likewise see two of its Calls through, and that is allowed too.
+     * Checked when the launches are collected rather than when the definition is
+     * read, because only the marking and the guards can say which Calls are live.
+     * Two Calls out of one place with exclusive guards is a legitimate choice —
+     * this saga runs a card payment or a subscription payment — and refusing the
+     * definition would reject the shape instead of the fault.
      *
      * @param  list<string>  $live  the Calls collected for this place so far
      * @param  array<string, int>  $marking  place => tokens
@@ -718,11 +721,12 @@ final readonly class SagaRunner
         $sagaClass = $saga::class;
         $names = implode(', ', array_map(static fn(string $n): string => "'$n'", $live));
 
-        throw new SagaException("Saga '$sagaId' ($sagaClass) has ".count($live).' '.Call::class." transitions fireable "
-            . "out of place '$place' ($names) but that place holds $tokens token(s). Firing a Call consumes a token, "
-            . "so only $tokens of them can ever be answered; the rest would run to the end and find their answer "
-            . 'unusable. Guard them so no more are live at once than the place can see through, or fork with a '
-            . 'transition that puts a token in a place of its own for each branch.');
+        throw new SagaException("Saga '$sagaId' ($sagaClass) starts ".count($live).' children at once from place '
+            . "'$place' ($names), which holds $tokens token(s). These read as parallel branches but cannot be: a place "
+            . 'with several outgoing transitions is a choice, and the first answer carries the token away, so the rest '
+            . "can never fire — their children would run to the end for nothing, or a join would wait forever. Either "
+            . 'guard them to be exclusive, which is what a choice means, or express the parallelism: a transition with '
+            . 'one target per branch and a Call on each, or an arc weight giving this place a token per Call.');
     }
 
     /**
