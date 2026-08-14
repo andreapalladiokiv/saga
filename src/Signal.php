@@ -87,11 +87,12 @@ class Signal extends Transition
      *     $payment = Signal::payload($event, PaymentReceived::class);
      *     $payment->card;      // typed, checked
      *
-     * The channel is Symfony's APPLY CONTEXT, and it lasts exactly one apply():
-     * whatever a listener has to keep beyond the step — the card, the reference,
+     * The channel is Symfony's APPLY CONTEXT. It carries along the phases of one
+     * apply — transition, enter, entered, completed, announce — and stops there.
+     * Whatever a listener has to keep beyond the step — the card, the reference,
      * the correlation — it folds into the subject, which is the only thing
-     * {@see SagaState} persists. Writing to the apply context to keep something is
-     * refused outright, because it used to look like it worked.
+     * {@see SagaState} persists. Writing to the apply context to keep something
+     * looks like it works and loses the value at the next step.
      *
      * The union of event types is because every event Symfony dispatches during
      * an apply carries the context — `transition` and also `leave`, `enter`,
@@ -112,10 +113,9 @@ class Signal extends Transition
      */
     public static function payload(Event $event, string $expected): object
     {
-        $key = SagaRunner::SIGNAL_CONTEXT_KEY;
         $context = method_exists($event, 'getContext') ? $event->getContext() : [];
 
-        $payload = $context[$key] ?? throw new SagaException(sprintf(
+        $payload = $context[SagaRunner::SIGNAL_CONTEXT_KEY] ?? throw new SagaException(sprintf(
             "Transition '%s' carries no signal payload. Either it is not a %s, or it was fired by "
             . 'run() rather than signal().',
             $event->getTransition()?->getName() ?? '?',

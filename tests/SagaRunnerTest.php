@@ -9,6 +9,7 @@ use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\Workflow\Definition;
+use Symfony\Component\Workflow\Event\EnteredEvent;
 use Symfony\Component\Workflow\Event\GuardEvent;
 use Symfony\Component\Workflow\Event\TransitionEvent;
 use Symfony\Component\Workflow\Registry;
@@ -206,52 +207,65 @@ final class SagaRunnerTest extends TestCase
         self::assertSame(['ready' => 1], $state->marking);
     }
 
-    // ───────────────── The apply context does not outlive the step ─────────────────
+    // ───────────────── The apply context ─────────────────
 
-    public function testAListenerWritingToTheApplyContextIsRefused(): void
+    public function testTheApplyContextCarriesFromOnePhaseOfAStepToTheNext(): void
     {
-        // Symfony's apply context lives for exactly one apply(): marking stores
-        // are handed it and conventionally drop it, and SagaState has nowhere to
-        // put it. A listener that stashes a correlation there has code that looks
-        // right, tests green inside the step, and loses the data on the next one.
-        // Nothing announced that, so it is announced here.
+        // Symfony passes the context along the phases of one apply — transition,
+        // enter, entered, completed, announce — and that is the channel for what
+        // a step needs WHILE it runs. The runner must not get in the way of it.
+        //
+        // The runner used to refuse any foreign key here, on the theory that
+        // writing to a per-apply channel means expecting it to persist. It does
+        // mean that sometimes, and that trap is documented on SagaMarkingStore,
+        // Signal::payload() and SagaState. But it is indistinguishable from this,
+        // which is legitimate, so the refusal killed a step that had just worked.
+        $seen = null;
         $saga = $this->register(new Definition(
             ['a', 'b'],
             [new Transition('t1', 'a', 'b')],
             ['a'],
         ));
         $this->onTransitionEvent($saga, 't1', static function (TransitionEvent $e): void {
-            $e->setContext(['payment_intent' => 'pi_123']);
+            $e->setContext([...$e->getContext(), 'computed' => 'xyz']);
         });
+        $this->dispatcher->addListener(
+            sprintf('workflow.%s.entered.b', $saga::class),
+            static function (EnteredEvent $e) use (&$seen): void {
+                $seen = $e->getContext()['computed'] ?? null;
+            },
+        );
 
         $this->runner->start($saga, 'ctx-1', new TestSubject);
         $msg = $this->queue->pop();
-
-        try {
-            $this->runner->run($saga, $msg['id'], $msg['transition']);
-            self::fail('writing to the apply context must not pass silently');
-        } catch (SagaException $e) {
-            self::assertStringContainsString('t1', $e->getMessage(), 'the transition must be named');
-            self::assertStringContainsString('payment_intent', $e->getMessage(), 'the key must be named');
-            self::assertStringContainsString('subject', $e->getMessage(), 'and where to put it instead');
-        }
-    }
-
-    public function testTheRunnersOwnApplyContextKeysAreNotMistakenForForeignOnes(): void
-    {
-        // The runner puts four keys in on every apply, so 'the context is not
-        // empty' is the normal case and cannot be the test.
-        $saga = $this->register(new Definition(
-            ['a', 'b'],
-            [new Transition('t1', 'a', 'b')],
-            ['a'],
-        ));
-
-        $this->runner->start($saga, 'ctx-2', new TestSubject);
-        $msg = $this->queue->pop();
         $this->runner->run($saga, $msg['id'], $msg['transition']);
 
-        self::assertNull($this->repository->load('ctx-2'), 'an ordinary step is unaffected');
+        self::assertSame('xyz', $seen, 'a later phase of the same step must see it');
+        self::assertNull($this->repository->load('ctx-1'), 'and the step must complete');
+    }
+
+    public function testWhatAListenerPutsInTheApplyContextIsGoneByTheNextStep(): void
+    {
+        // The trap itself, pinned rather than refused: the channel lasts one
+        // apply. Nothing persists it — SagaState has marking, subject, history
+        // and version — so the next step starts with the runner's own keys only.
+        $saw = [];
+        $saga = $this->register(new Definition(
+            ['a', 'b', 'c'],
+            [new Transition('t1', 'a', 'b'), new Transition('t2', 'b', 'c')],
+            ['a'],
+        ));
+        $this->onTransitionEvent($saga, 't1', static function (TransitionEvent $e): void {
+            $e->setContext([...$e->getContext(), 'remembered' => 'nope']);
+        });
+        $this->onTransitionEvent($saga, 't2', static function (TransitionEvent $e) use (&$saw): void {
+            $saw[] = $e->getContext()['remembered'] ?? 'gone';
+        });
+
+        $this->runner->start($saga, 'ctx-2', new TestSubject);
+        $this->drain($saga);
+
+        self::assertSame(['gone'], $saw, 'anything meant to outlive the step belongs on the subject');
     }
 
     // ───────────────── Mutual exclusion ─────────────────

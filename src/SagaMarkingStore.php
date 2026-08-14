@@ -58,8 +58,11 @@ final class SagaMarkingStore implements MarkingStoreInterface
      * {@see SagaState} persists marking, subject, history and version, and
      * long-lived run state belongs on the SUBJECT.
      *
-     * A listener that writes to it anyway is refused rather than quietly ignored;
-     * see {@see SagaRunner::assertNothingWasStashedInTheApplyContext()}.
+     * Writing to it is not refused — Symfony carries it along the phases of one
+     * apply, so passing something from a transition listener to an entered one is
+     * the channel working as designed, and it is indistinguishable from an attempt
+     * to remember. Only the second is a mistake, and it is a mistake this docblock
+     * exists to name rather than one the runner can catch.
      *
      * @param  array<string, mixed>  $context  Symfony's per-apply context; discarded
      */
