@@ -546,15 +546,15 @@ final readonly class SagaRunner
     public static function childId(Event $event, string $call): ?string
     {
         $context = method_exists($event, 'getContext') ? $event->getContext() : [];
-        $children = $context[self::CHILD_CONTEXT_KEY] ?? [];
+        $child = self::childFrom($event, $call);
 
-        return is_array($children) && is_string($children[$call] ?? null) ? $children[$call] : null;
+        return $child === null ? null : $child[0];
     }
 
     /**
-     * Every Call's latest child id, read out of the row's own journal.
+     * Every Call's latest child, read out of the row's own journal.
      *
-     * @return array<string, string> the Call's name => the child's id
+     * @return array<string, array{string, class-string<Saga>}> the Call's name => [id, saga class]
      */
     private function childrenOf(SagaState $state): array
     {
@@ -565,9 +565,9 @@ final readonly class SagaRunner
                 continue;
             }
 
-            /** @var array{string, int, string} $record */
+            /** @var array{string, int, string, class-string<Saga>} $record */
             $record = json_decode(substr($entry, strlen(self::CHILD)), true, 512, JSON_THROW_ON_ERROR);
-            $children[$record[0]] = $record[2];
+            $children[$record[0]] = [$record[2], $record[3]];
         }
 
         return $children;
@@ -596,6 +596,95 @@ final readonly class SagaRunner
     }
 
     /**
+     * Says something to the child a {@see Call} launched — the mirror of
+     * {@see reply()}.
+     *
+     * reply() carries an answer up to whoever called this saga; this carries an
+     * instruction down to a saga this one called. A checkout that has been told
+     * its payment is authorized, has settled its own books, and now wants the
+     * intent captured says so here:
+     *
+     *     SagaRunner::tell($event, 'pay', new CaptureRequested($amount));
+     *
+     * The child is named by the Call that launched it, not by an id: the runner
+     * wrote the id down when it handed it out, so the caller does not have to have
+     * kept a copy. The latest attempt's child, because that is the live one — a
+     * business retry hands out a new id and the previous child is done with.
+     *
+     * Usable after the Call has already fired. That is the point: the child
+     * answered, this saga moved on, and the child is still alive waiting to be
+     * told what to do. It only needs the record, which stays in history.
+     *
+     * Delivered the same way an answer is — recorded in the step's outbox and sent
+     * once this saga's lock is released — so this cannot be the deadlock that a
+     * hand-written signal() from inside a step is. The child receives it as an
+     * ordinary {@see Signal}, chosen by payload type from whatever it is parked on,
+     * so it must declare a Signal awaiting this type. A child that has finished
+     * hears nothing, as with any signal to a saga that is gone.
+     *
+     * @param  Event<object>  $event
+     *
+     * @throws SagaException when no Call by that name has launched anything from
+     *                       this saga, or the event did not come from an apply this
+     *                       runner drove
+     */
+    public static function tell(Event $event, string $call, object $payload): void
+    {
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
+
+        $outbox = $context[self::OUTBOX_CONTEXT_KEY] ?? null;
+        if (! $outbox instanceof SagaOutbox) {
+            throw new SagaException(sprintf(
+                "Cannot tell '%s' anything from transition '%s': the event did not come from an apply driven by %s.",
+                $call,
+                $event->getTransition()?->getName() ?? '?',
+                self::class,
+            ));
+        }
+
+        $child = self::childFrom($event, $call);
+        if ($child === null) {
+            // Unlike reply(), there IS a target to get wrong here: the Call's name
+            // is a string. Nothing launched under it means a typo or a Call that
+            // has not run yet, and both are worth hearing about.
+            throw new SagaException(sprintf(
+                "Cannot tell '%s' anything from transition '%s': no %s by that name has launched a saga from "
+                . 'this one. Check the name against the definition, and that the Call has already run.',
+                $call,
+                $event->getTransition()?->getName() ?? '?',
+                Call::class,
+            ));
+        }
+
+        [$childId, $childClass] = $child;
+        $outbox->add(new DeliverMessage($childClass, $childId, $payload));
+    }
+
+    /**
+     * A Call's latest child, as recorded in the apply context.
+     *
+     * @param  Event<object>  $event
+     * @return array{string, class-string<Saga>}|null
+     */
+    private static function childFrom(Event $event, string $call): ?array
+    {
+        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
+        $children = $context[self::CHILD_CONTEXT_KEY] ?? [];
+
+        if (! is_array($children)) {
+            return null;
+        }
+
+        $child = $children[$call] ?? null;
+        if (! is_array($child) || ! is_string($child[0] ?? null) || ! is_string($child[1] ?? null)) {
+            return null;
+        }
+
+        /** @var array{string, class-string<Saga>} the journal is written by the runner from a Call's own $runs */
+        return [$child[0], $child[1]];
+    }
+
+    /**
      * Runs what a step asked to have done to other sagas, with no lock held.
      *
      * Deliberately after {@see SagaLock::withLock()} returns, for the same reason
@@ -615,6 +704,12 @@ final readonly class SagaRunner
         foreach ($outbox->actions() as $action) {
             if ($action instanceof LaunchChild) {
                 $this->launch($action);
+
+                continue;
+            }
+
+            if ($action instanceof DeliverMessage) {
+                $this->say($action);
 
                 continue;
             }
@@ -692,6 +787,20 @@ final readonly class SagaRunner
      * answer and moved on — while the child it was actually waiting for answered
      * into nothing.
      */
+    /**
+     * Delivers what a caller had to say to its child.
+     *
+     * An ordinary signal, so the child's own guards and awaited types decide, and
+     * a child that has finished simply is not there — SignalOutcome::NotFound, and
+     * already silent. A child that is alive but parked on nothing accepting this
+     * raises {@see SagaNotWaitingException}, which is not swallowed: the caller
+     * asked for something and it did not happen.
+     */
+    private function say(DeliverMessage $message): void
+    {
+        $this->signal($this->sagas->get($message->childClass), $message->childId, $message->payload);
+    }
+
     private function deliver(DeliverReply $reply): void
     {
         $caller = $this->sagas->get($reply->callerClass);
@@ -878,7 +987,7 @@ final readonly class SagaRunner
             if ($childId === null) {
                 $childId = $this->childIdFor($transition, $sagaId, $childSubject, $attempt);
                 $journal[] = self::CHILD.json_encode(
-                    [$transition->getName(), $attempt, $childId],
+                    [$transition->getName(), $attempt, $childId, $transition->runs],
                     JSON_THROW_ON_ERROR,
                 );
             }
@@ -909,7 +1018,7 @@ final readonly class SagaRunner
                 continue;
             }
 
-            /** @var array{string, int, string} $record */
+            /** @var array{string, int, string, class-string<Saga>} $record */
             $record = json_decode(substr($entry, strlen(self::CHILD)), true, 512, JSON_THROW_ON_ERROR);
 
             if ($record[0] === $transition && $record[1] === $attempt) {

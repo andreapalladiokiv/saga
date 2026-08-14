@@ -27,6 +27,7 @@ use Techork\Saga\SagaQueue;
 use Techork\Saga\SagaRunner;
 use Techork\Saga\Signal;
 use Techork\Saga\SignalOutcome;
+use Techork\Saga\Tests\Call\CaptureRequested;
 use Techork\Saga\Tests\Call\ChallengeFailed;
 use Techork\Saga\Tests\Call\ChallengePassed;
 use Techork\Saga\Tests\Call\CheckoutSaga;
@@ -499,7 +500,8 @@ final class CallTest extends TestCase
         self::assertContains('checkout:authorized:auth-77', $this->log);
         self::assertContains('checkout:settled', $this->log);
         self::assertNull($this->repository->load('chk-1'), 'the checkout ran to the end');
-        self::assertNull($this->repository->load($this->childOf('chk-1', 'pay', 1)));
+        self::assertSame(['authorized' => 1], $this->repository->load($this->childOf('chk-1', 'pay', 1))?->marking,
+            'the child stays alive after answering, waiting to be told whether to capture');
     }
 
     public function testTheAnswerIsDeliveredWithNoLockHeldSoAnInlineDriverDoesNotDeadlock(): void
@@ -567,7 +569,80 @@ final class CallTest extends TestCase
 
         self::assertSame(SignalOutcome::Applied, $outcome, 'the step runs as it would for a child');
         self::assertContains('intent:passed', $this->log, 'including its reply(), which reaches nobody');
-        self::assertNull($this->repository->load('pi-standalone'), 'and the saga finished');
+        self::assertSame(['authorized' => 1], $this->repository->load('pi-standalone')?->marking,
+            'and it parks on its own next wait exactly as a child would');
+    }
+
+    // ───────────────── the caller talking back down ─────────────────
+
+    public function testTheCallerCanTellItsChildSomethingAfterTheCallHasFired(): void
+    {
+        // The chain a hand-written bridge cannot survive, end to end and under an
+        // inline driver: the checkout launches the intent, the intent answers, the
+        // checkout settles and then instructs the intent to capture. Doing that
+        // last step with signal() from inside a listener re-enters the intent's
+        // lock — the intent's own step is what is running — and both sagas are left
+        // split-brained. Declared, it is two outbox actions and no held lock.
+        $this->boot();
+        $this->on(CheckoutSaga::class, 'settle', function (TransitionEvent $e): void {
+            SagaRunner::tell($e, 'pay', new CaptureRequested($e->getSubject()->amount));
+        });
+        $this->on(PaymentIntentSaga::class, 'capture', function (TransitionEvent $e): void {
+            $this->log[] = 'intent:captured:'.Signal::payload($e, CaptureRequested::class)->amount;
+        });
+
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+        $this->runner->signal($this->intent, $this->childOf('chk-1', 'pay', 1), new ChallengePassed('auth-77'));
+
+        self::assertSame([
+            'step:place#chk-1',
+            'step:create#chk-1/pay/1',
+            'intent:passed',
+            'checkout:authorized:auth-77',
+            'step:settle#chk-1',
+            'checkout:settled',
+            'intent:captured:49.99',
+        ], $this->log);
+        self::assertNull($this->repository->load('chk-1'), 'the checkout finished');
+        self::assertNull($this->repository->load($this->childOf('chk-1', 'pay', 1)), 'and so did the intent');
+    }
+
+    public function testTellingACallThatHasLaunchedNothingIsRefused(): void
+    {
+        // Unlike reply(), the target here is a name — so it can be got wrong, and
+        // a typo would otherwise be a message that silently goes nowhere.
+        $this->boot();
+        $this->on(CheckoutSaga::class, 'place', function (TransitionEvent $e): void {
+            SagaRunner::tell($e, 'paay', new CaptureRequested('1.00'));
+        });
+
+        try {
+            $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+            self::fail('a Call name that launched nothing must be refused');
+        } catch (SagaException $e) {
+            self::assertStringContainsString("'paay'", $e->getMessage());
+        }
+    }
+
+    public function testTellingAChildThatHasAlreadyFinishedIsSilent(): void
+    {
+        // Symmetric with an answer arriving for a caller that is gone: there is
+        // nobody to hear it, and that is not a fault of this saga.
+        $this->boot();
+        $this->on(CheckoutSaga::class, 'settle', function (TransitionEvent $e): void {
+            SagaRunner::tell($e, 'pay', new CaptureRequested('49.99'));
+        });
+
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+        $child = $this->childOf('chk-1', 'pay', 1);
+        $this->runner->signal($this->intent, $child, new ChallengePassed('auth-77'));
+
+        // it answered and was then removed before the caller got round to it
+        $this->repository->delete($child);
+        self::assertNull($this->repository->load($child));
+
+        // nothing raised, and the caller is unaffected
+        self::assertNull($this->repository->load('chk-1'));
     }
 
     // ───────────────── retries and recovery ─────────────────
@@ -702,7 +777,7 @@ final class CallTest extends TestCase
         $drain();
 
         self::assertNull($this->repository->load('chk-q'), 'the checkout settled and finished');
-        self::assertNull($this->repository->load($child));
+        self::assertSame(['authorized' => 1], $this->repository->load($child)?->marking);
     }
 
     // ───────────────── compensation ─────────────────

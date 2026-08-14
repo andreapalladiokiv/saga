@@ -23,29 +23,29 @@ namespace Techork\Saga;
  */
 final class SagaOutbox
 {
-    /** @var list<LaunchChild|DeliverReply> */
+    /** @var list<LaunchChild|DeliverReply|DeliverMessage> */
     private array $actions = [];
 
-    public function add(LaunchChild|DeliverReply $action): void
+    public function add(LaunchChild|DeliverReply|DeliverMessage $action): void
     {
         $this->actions[] = $action;
     }
 
-    /** @return list<LaunchChild|DeliverReply> launches first: an answer cannot precede its child */
+    /** @return list<LaunchChild|DeliverReply|DeliverMessage> launches first: nothing can be said to a child that is not there yet */
     public function actions(): array
     {
         $launches = [];
-        $replies = [];
+        $rest = [];
 
         foreach ($this->actions as $action) {
             if ($action instanceof LaunchChild) {
                 $launches[] = $action;
             } else {
-                $replies[] = $action;
+                $rest[] = $action;
             }
         }
 
-        return [...$launches, ...$replies];
+        return [...$launches, ...$rest];
     }
 
     public function isEmpty(): bool
