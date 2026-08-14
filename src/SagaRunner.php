@@ -489,10 +489,21 @@ final readonly class SagaRunner
      * arrives as the Call's payload and its listener reads it with
      * {@see Signal::payload()}.
      *
+     * Answering nobody does nothing. A saga worth reusing is one that also runs on
+     * its own — started by an endpoint, by an operator — and this used to throw
+     * there, which meant guarding every reply site with {@see hasCaller()} in every
+     * such saga. There is nothing for the exception to protect: no target to get
+     * wrong, and a caller that never hears back is visible as a caller still parked
+     * on its Call. So a standalone run simply has nobody to tell.
+     *
+     * {@see hasCaller()} remains for a saga that wants to do something ELSE when
+     * it has no caller — publish a domain event, write a read model — rather than
+     * merely skip the answer.
+     *
      * @param  Event<object>  $event
      *
-     * @throws SagaException when this saga has no caller, or the event did not
-     *                       come from an apply this runner drove
+     * @throws SagaException when the event did not come from an apply this runner
+     *                       drove
      */
     public static function reply(Event $event, object $payload): void
     {
@@ -509,12 +520,7 @@ final readonly class SagaRunner
 
         $caller = $context[self::CALLER_CONTEXT_KEY] ?? null;
         if ($caller === null) {
-            throw new SagaException(sprintf(
-                "Cannot reply from transition '%s': this saga has no caller. Only a saga started by a %s "
-                . 'has something to answer; one started directly has nowhere to send it.',
-                $event->getTransition()?->getName() ?? '?',
-                Call::class,
-            ));
+            return;
         }
 
         [$callerClass, $callerId, $callerTransition, $callerAttempt] = $caller;
@@ -571,14 +577,14 @@ final readonly class SagaRunner
      * Whether this saga was started by a {@see Call}, and so has somewhere to
      * {@see reply()}.
      *
-     * A saga worth reusing is one that runs both ways — launched by a Call from
-     * some larger flow, and started directly by an endpoint or an operator. Such
-     * a saga has to ask, and asking by catching the exception reply() throws
-     * would mean matching on a message.
+     * Not needed merely to answer: {@see reply()} does nothing when there is no
+     * caller, so a reusable saga calls it unconditionally. This is for one that
+     * wants to do something ELSE on its own — publish a domain event, write a read
+     * model, notify some other way:
      *
-     *     if (SagaRunner::hasCaller($event)) {
-     *         SagaRunner::reply($event, new PaymentAuthorized($code));
-     *     }
+     *     SagaRunner::hasCaller($event)
+     *         ? SagaRunner::reply($event, $authorized)
+     *         : $this->events->dispatch($authorized);
      *
      * @param  Event<object>  $event
      */

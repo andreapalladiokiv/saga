@@ -26,6 +26,7 @@ use Techork\Saga\SagaMarkingStore;
 use Techork\Saga\SagaQueue;
 use Techork\Saga\SagaRunner;
 use Techork\Saga\Signal;
+use Techork\Saga\SignalOutcome;
 use Techork\Saga\Tests\Call\ChallengeFailed;
 use Techork\Saga\Tests\Call\ChallengePassed;
 use Techork\Saga\Tests\Call\CheckoutSaga;
@@ -542,6 +543,8 @@ final class CallTest extends TestCase
 
         $seen = [];
         $this->on(PaymentIntentSaga::class, 'create', function (TransitionEvent $e) use (&$seen): void {
+            // asked in order to do something ELSE when standalone, not in order
+            // to decide whether replying is safe — reply() handles that itself
             $seen[SagaRunner::sagaId($e)] = SagaRunner::hasCaller($e);
         });
 
@@ -552,17 +555,19 @@ final class CallTest extends TestCase
         self::assertFalse($seen['pi-direct'] ?? null, 'one started directly has none');
     }
 
-    public function testASagaWithNoCallerCannotReply(): void
+    public function testASagaWithNoCallerSimplyDoesNotAnswer(): void
     {
+        // The same saga, run on its own. Reusability is the point of the design,
+        // so answering nobody must not be an error — otherwise every reply site in
+        // every reusable saga needs a hasCaller() guard around it.
         $this->boot();
 
-        // started directly, so there is nobody to answer
         $this->runner->start($this->intent, 'pi-standalone', new PaymentIntentSubject('ord-9', '5.00'));
+        $outcome = $this->runner->signal($this->intent, 'pi-standalone', new ChallengePassed('auth-x'));
 
-        $this->expectException(SagaException::class);
-        $this->expectExceptionMessageMatches('/has no caller/');
-
-        $this->runner->signal($this->intent, 'pi-standalone', new ChallengePassed('auth-x'));
+        self::assertSame(SignalOutcome::Applied, $outcome, 'the step runs as it would for a child');
+        self::assertContains('intent:passed', $this->log, 'including its reply(), which reaches nobody');
+        self::assertNull($this->repository->load('pi-standalone'), 'and the saga finished');
     }
 
     // ───────────────── retries and recovery ─────────────────
