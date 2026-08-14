@@ -12,9 +12,15 @@ use Symfony\Component\Workflow\Arc;
  *
  * Entering the place a Call leaves launches {@see $runs}; the saga then parks
  * there exactly as it would on a Signal, and the only thing that moves it on is
- * the child's answer, delivered as the transition's payload. So the parent reads
- * the result with the same {@see Signal::payload()} as any other signal and does
- * whatever it likes with it — the child hands back a fact, not a decision.
+ * the child FINISHING. The runner then fires this edge with the child's final
+ * SUBJECT as the payload, read with the same {@see Signal::payload()} as any
+ * other signal.
+ *
+ * There is no answer type to declare and no answer to send. A saga's state is its
+ * subject, so its result is its subject, and it reports by ending. One writer per
+ * row follows: the child owns its subject while it lives, the caller only reads
+ * it, and only afterwards. Nothing carries an answer DTO between them and neither
+ * reaches into the other's row.
  *
  *     new Call('pay', 'awaiting_payment', 'authorized',
  *         runs:    PaymentIntentSaga::class,
@@ -78,8 +84,8 @@ final class Call extends Signal
     /**
      * @param  string|string[]|Arc[]  $froms  where the parent parks while the child runs
      * @param  string|string[]|Arc[]  $tos    where it goes once the child answers
-     * @param  class-string<Saga>  $runs  the saga to launch on entering the parking place
-     * @param  class-string  $awaits  the answer type this Call accepts
+     * @param  Saga  $runs  the saga to launch on entering the parking place — the object, so an
+     *                       application resolves it however it resolves anything else
      * @param  Closure(object): object  $subject  builds the child's subject from the parent's
      * @param  Closure(object, int): string|null  $id  names the child from its own subject and the
      *                                                 attempt number; omit for the default
@@ -88,12 +94,27 @@ final class Call extends Signal
         string $name,
         string|array $froms,
         string|array $tos,
-        public readonly string $runs,
-        string $awaits,
+        public readonly Saga $runs,
         public readonly Closure $subject,
         public readonly ?Closure $id = null,
     ) {
-        parent::__construct($name, $froms, $tos, $awaits);
+        // Signal needs an awaited type and this is the honest one: what a Call
+        // waits for is that saga, finishing. It is never used for matching —
+        // see accepts().
+        parent::__construct($name, $froms, $tos, $runs::class);
+    }
+
+    /**
+     * Never true. A Call is fired by one thing only: the runner, once the saga it
+     * launched has finished.
+     *
+     * So an external signal() cannot trip it however well its payload happens to
+     * match. The caller's wait belongs to its child, and letting a webhook satisfy
+     * it would close a wait whose child is still running.
+     */
+    public function accepts(object $answer): bool
+    {
+        return false;
     }
 
     /** The child's subject, built from the parent's. */

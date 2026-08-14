@@ -117,26 +117,6 @@ final readonly class SagaRunner
     public const OUTBOX_CONTEXT_KEY = 'saga.outbox';
 
     /**
-     * Where the apply context carries who called this saga, for {@see reply()}.
-     *
-     * Read out of the row's own history rather than passed around: a child is
-     * signalled by webhooks and workers that know nothing about its caller.
-     */
-    private const CALLER_CONTEXT_KEY = 'saga.caller';
-
-    /**
-     * Where the apply context carries the child ids this saga has handed out, for
-     * {@see childId()}.
-     *
-     * A generated id has to reach the steps that come after the launch — the one
-     * that captures the payment, the one that answers a webhook about it — and
-     * that is a step boundary, which is a process boundary. The runner already
-     * writes the id down when it hands it out; this passes the record along rather
-     * than making every caller keep its own copy of what the engine knows.
-     */
-    private const CHILD_CONTEXT_KEY = 'saga.children';
-
-    /**
      * Journalled into `history` at birth when a {@see Call} started this saga,
      * carrying the caller's class, id and the Call's name.
      *
@@ -174,6 +154,23 @@ final readonly class SagaRunner
      */
     private const CHILD = '!saga:child:';
 
+    /**
+     * Appended to `history` when a saga that a {@see Call} launched has reached its
+     * end but has not been collected yet.
+     *
+     * Such a saga outlives its own completion by one step. Its final subject is its
+     * result, and the row is where that result waits — so the queue message telling
+     * the caller carries nothing, {@see SagaQueue} needs no widening, and a subject
+     * is never serialised into a second place.
+     *
+     * The marker is what separates a saga still running from one waiting to be
+     * collected: both have a row, and only the second is finished. Advancing one is
+     * refused, and {@see requeue()} re-tells a caller whose notification was lost —
+     * which is recovery the old arrangement could not offer, because an answer sent
+     * and dropped left nothing behind to find.
+     */
+    private const COMPLETED = '!saga:completed';
+
     public function __construct(
         private SagaStateRepository      $repository,
         private SagaQueue                $queue,
@@ -181,7 +178,6 @@ final readonly class SagaRunner
         private Registry                 $workflows,
         private SagaMarkingStore         $markingStore,
         private SagaLock                 $lock,
-        private SagaLocator              $sagas = new NewInstanceSagaLocator(),
     ) {}
 
     /**
@@ -386,6 +382,7 @@ final readonly class SagaRunner
         }
 
         $this->assertRollbackIsNotIncomplete($state, $sagaId);
+        $this->assertNotAwaitingCollection($state, $sagaId);
         $this->assertMarkingIsNotEmpty($state, $sagaId);
 
         $subject = $state->subject;
@@ -468,199 +465,6 @@ final readonly class SagaRunner
     }
 
     /**
-     * The child's answer to whoever called it.
-     *
-     * The only way a saga addresses another saga, and it can address exactly one:
-     * the {@see Call} that started it. That narrowness is the whole safety
-     * argument — there is no target to get wrong, no lock to take in the wrong
-     * order, and no way to build a cycle. Compare a hand-written bridge, which
-     * can signal anything from anywhere and deadlocks the moment two sagas reach
-     * for each other.
-     *
-     *     SagaRunner::reply($event, new PaymentAuthorized($code));
-     *
-     * The answer is not sent here. It is recorded in the step's outbox and
-     * delivered once this saga's lock is released, so the caller is signalled
-     * with nothing held. A step that throws never persists and its answer is
-     * dropped with it.
-     *
-     * Answering is not tied to finishing: a saga may answer at any step and carry
-     * on. What the caller does with the answer is the caller's business — it
-     * arrives as the Call's payload and its listener reads it with
-     * {@see Signal::payload()}.
-     *
-     * Answering nobody does nothing. A saga worth reusing is one that also runs on
-     * its own — started by an endpoint, by an operator — and this used to throw
-     * there, which meant guarding every reply site with {@see hasCaller()} in every
-     * such saga. There is nothing for the exception to protect: no target to get
-     * wrong, and a caller that never hears back is visible as a caller still parked
-     * on its Call. So a standalone run simply has nobody to tell.
-     *
-     * {@see hasCaller()} remains for a saga that wants to do something ELSE when
-     * it has no caller — publish a domain event, write a read model — rather than
-     * merely skip the answer.
-     *
-     * @param  Event<object>  $event
-     *
-     * @throws SagaException when the event did not come from an apply this runner
-     *                       drove
-     */
-    public static function reply(Event $event, object $payload): void
-    {
-        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
-
-        $outbox = $context[self::OUTBOX_CONTEXT_KEY] ?? null;
-        if (! $outbox instanceof SagaOutbox) {
-            throw new SagaException(sprintf(
-                "Cannot reply from transition '%s': the event did not come from an apply driven by %s.",
-                $event->getTransition()?->getName() ?? '?',
-                self::class,
-            ));
-        }
-
-        $caller = $context[self::CALLER_CONTEXT_KEY] ?? null;
-        if ($caller === null) {
-            return;
-        }
-
-        [$callerClass, $callerId, $callerTransition, $callerAttempt] = $caller;
-        $outbox->add(new DeliverReply($callerClass, $callerId, $callerTransition, $callerAttempt, $payload));
-    }
-
-    /**
-     * Every Call's latest child, read out of the row's own journal.
-     *
-     * @return array<string, array{string, class-string<Saga>}> the Call's name => [id, saga class]
-     */
-    private function childrenOf(SagaState $state): array
-    {
-        $children = [];
-
-        foreach ($state->history as $entry) {
-            if (! str_starts_with($entry, self::CHILD)) {
-                continue;
-            }
-
-            /** @var array{string, int, string, class-string<Saga>} $record */
-            $record = json_decode(substr($entry, strlen(self::CHILD)), true, 512, JSON_THROW_ON_ERROR);
-            $children[$record[0]] = [$record[2], $record[3]];
-        }
-
-        return $children;
-    }
-
-    /**
-     * Whether this saga was started by a {@see Call}, and so has somewhere to
-     * {@see reply()}.
-     *
-     * Not needed merely to answer: {@see reply()} does nothing when there is no
-     * caller, so a reusable saga calls it unconditionally. This is for one that
-     * wants to do something ELSE on its own — publish a domain event, write a read
-     * model, notify some other way:
-     *
-     *     SagaRunner::hasCaller($event)
-     *         ? SagaRunner::reply($event, $authorized)
-     *         : $this->events->dispatch($authorized);
-     *
-     * @param  Event<object>  $event
-     */
-    public static function hasCaller(Event $event): bool
-    {
-        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
-
-        return isset($context[self::CALLER_CONTEXT_KEY]);
-    }
-
-    /**
-     * Says something to the child a {@see Call} launched — the mirror of
-     * {@see reply()}.
-     *
-     * reply() carries an answer up to whoever called this saga; this carries an
-     * instruction down to a saga this one called. A checkout that has been told
-     * its payment is authorized, has settled its own books, and now wants the
-     * intent captured says so here:
-     *
-     *     SagaRunner::tell($event, 'pay', new CaptureRequested($amount));
-     *
-     * The child is named by the Call that launched it, not by an id: the runner
-     * wrote the id down when it handed it out, so the caller does not have to have
-     * kept a copy. The latest attempt's child, because that is the live one — a
-     * business retry hands out a new id and the previous child is done with.
-     *
-     * Usable after the Call has already fired. That is the point: the child
-     * answered, this saga moved on, and the child is still alive waiting to be
-     * told what to do. It only needs the record, which stays in history.
-     *
-     * Delivered the same way an answer is — recorded in the step's outbox and sent
-     * once this saga's lock is released — so this cannot be the deadlock that a
-     * hand-written signal() from inside a step is. The child receives it as an
-     * ordinary {@see Signal}, chosen by payload type from whatever it is parked on,
-     * so it must declare a Signal awaiting this type. A child that has finished
-     * hears nothing, as with any signal to a saga that is gone.
-     *
-     * @param  Event<object>  $event
-     *
-     * @throws SagaException when no Call by that name has launched anything from
-     *                       this saga, or the event did not come from an apply this
-     *                       runner drove
-     */
-    public static function tell(Event $event, string $call, object $payload): void
-    {
-        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
-
-        $outbox = $context[self::OUTBOX_CONTEXT_KEY] ?? null;
-        if (! $outbox instanceof SagaOutbox) {
-            throw new SagaException(sprintf(
-                "Cannot tell '%s' anything from transition '%s': the event did not come from an apply driven by %s.",
-                $call,
-                $event->getTransition()?->getName() ?? '?',
-                self::class,
-            ));
-        }
-
-        $child = self::childFrom($event, $call);
-        if ($child === null) {
-            // Unlike reply(), there IS a target to get wrong here: the Call's name
-            // is a string. Nothing launched under it means a typo or a Call that
-            // has not run yet, and both are worth hearing about.
-            throw new SagaException(sprintf(
-                "Cannot tell '%s' anything from transition '%s': no %s by that name has launched a saga from "
-                . 'this one. Check the name against the definition, and that the Call has already run.',
-                $call,
-                $event->getTransition()?->getName() ?? '?',
-                Call::class,
-            ));
-        }
-
-        [$childId, $childClass] = $child;
-        $outbox->add(new DeliverMessage($childClass, $childId, $payload));
-    }
-
-    /**
-     * A Call's latest child, as recorded in the apply context.
-     *
-     * @param  Event<object>  $event
-     * @return array{string, class-string<Saga>}|null
-     */
-    private static function childFrom(Event $event, string $call): ?array
-    {
-        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
-        $children = $context[self::CHILD_CONTEXT_KEY] ?? [];
-
-        if (! is_array($children)) {
-            return null;
-        }
-
-        $child = $children[$call] ?? null;
-        if (! is_array($child) || ! is_string($child[0] ?? null) || ! is_string($child[1] ?? null)) {
-            return null;
-        }
-
-        /** @var array{string, class-string<Saga>} the journal is written by the runner from a Call's own $runs */
-        return [$child[0], $child[1]];
-    }
-
-    /**
      * Runs what a step asked to have done to other sagas, with no lock held.
      *
      * Deliberately after {@see SagaLock::withLock()} returns, for the same reason
@@ -669,11 +473,10 @@ final readonly class SagaRunner
      * hand-written bridge cannot avoid. Here the runner owns both ends, so it can
      * choose the safe moment.
      *
-     * Failures are not swallowed — a child that cannot be started, or an answer
-     * that cannot be delivered, means the flow has stalled and the caller (a
-     * queue job) should hear about it. The exceptions a redelivered step
-     * legitimately produces are the two that mean 'already done', and those are
-     * absorbed at each action.
+     * Failures are not swallowed — a child that cannot be started means the flow
+     * has stalled and the queue job should hear about it. The exception a
+     * redelivered step legitimately produces is the one that means 'already
+     * there', and that is absorbed at the launch.
      */
     private function perform(SagaOutbox $outbox): void
     {
@@ -684,20 +487,31 @@ final readonly class SagaRunner
                 continue;
             }
 
-            if ($action instanceof DeliverMessage) {
-                $this->say($action);
-
-                continue;
-            }
-
-            $this->deliver($action);
+            $this->notify($action);
         }
+    }
+
+    /**
+     * Tells a caller that the saga it launched has finished — by queueing its Call.
+     *
+     * A queue message and not a direct apply, for two reasons that turned out to be
+     * the same one. The caller has to be resolved from a class name, and after a
+     * park that only happens on the other side of a queue, where {@see
+     * \Techork\Saga\Laravel\SagaStepJob} already carries the name and lets the
+     * application's own container resolve it. And nothing has to be carried in the
+     * message: the child's row is still there, holding its final subject, so the
+     * caller's step reads it rather than being handed a copy.
+     *
+     * Which is why this needs no widening of {@see SagaQueue} and no second place
+     * where a subject is serialised.
+     */
+    private function notify(NotifyCaller $notify): void
+    {
+        $this->queue->push($notify->callerClass, $notify->callerId, $notify->callerTransition);
     }
 
     private function launch(LaunchChild $launch): void
     {
-        $child = $this->sagas->get($launch->sagaClass);
-
         $caller = self::CALLER.json_encode([
             $launch->callerClass,
             $launch->callerId,
@@ -706,7 +520,7 @@ final readonly class SagaRunner
         ], JSON_THROW_ON_ERROR);
 
         try {
-            $this->startSeeded($child, $launch->childId, $launch->subject, [$caller]);
+            $this->startSeeded($launch->saga, $launch->childId, $launch->subject, [$caller]);
         } catch (SagaAlreadyExistsException $e) {
             $this->assertTheExistingChildIsThisOne($launch, $e);
         }
@@ -763,149 +577,6 @@ final readonly class SagaRunner
      * answer and moved on — while the child it was actually waiting for answered
      * into nothing.
      */
-    /**
-     * Delivers what a caller had to say to its child.
-     *
-     * An ordinary signal, so the child's own guards and awaited types decide, and
-     * a child that has finished simply is not there — SignalOutcome::NotFound, and
-     * already silent. A child that is alive but parked on nothing accepting this
-     * raises {@see SagaNotWaitingException}, which is not swallowed: the caller
-     * asked for something and it did not happen.
-     */
-    private function say(DeliverMessage $message): void
-    {
-        $this->signal($this->sagas->get($message->childClass), $message->childId, $message->payload);
-    }
-
-    private function deliver(DeliverReply $reply): void
-    {
-        $caller = $this->sagas->get($reply->callerClass);
-
-        $dispatch = $this->lock->withLock(
-            $reply->callerId,
-            fn(): array => $this->answerExclusively($caller, $reply),
-        );
-
-        /** @var list<string> $dispatch */
-        $this->dispatch($caller, $reply->callerId, $dispatch);
-    }
-
-    /**
-     * Applies an answer to the exact Call that awaits it, or drops it.
-     *
-     * An answer is dropped, not refused, when the wait it belongs to is over: the
-     * caller is gone, or it has left the parking place, or it has come back to
-     * that place for a LATER attempt than this answer belongs to. Answers are
-     * at-least-once and a child may outlive the caller's patience, so a late one
-     * is the normal shape of the world rather than a fault — but it must not be
-     * mistaken for the answer to the wait now in progress.
-     *
-     * @return list<string> transitions to enqueue
-     */
-    private function answerExclusively(Saga $caller, DeliverReply $reply): array
-    {
-        $state = $this->repository->load($reply->callerId);
-        if ($state === null || in_array(self::ROLLBACK_FAILED, $state->history, true)) {
-            return [];
-        }
-
-        $subject = $state->subject;
-        $workflow = $this->workflowFor($caller, $subject, $reply->callerId);
-        $this->assertMarkingStillFits($workflow, $state, $reply->callerId);
-        $this->markingStore->setMarking($subject, new Marking($state->marking));
-
-        $call = null;
-        foreach ($workflow->getEnabledTransitions($subject) as $transition) {
-            if ($transition instanceof Call && $transition->getName() === $reply->callerTransition) {
-                $call = $transition;
-                break;
-            }
-        }
-
-        if ($call === null) {
-            // The caller is not waiting on this Call any more.
-            return [];
-        }
-
-        $parking = null;
-        foreach ($call->getFroms() as $from) {
-            if (isset($state->marking[$from])) {
-                $parking = $from;
-                break;
-            }
-        }
-
-        if ($parking === null
-            || $this->timesEntered($workflow, $state->history, $parking) !== $reply->callerAttempt
-        ) {
-            // A different attempt's wait. Applying this would settle the current
-            // one with an answer from a child the caller has already written off.
-            return [];
-        }
-
-        // Which exit of the wait this answer takes. The Call names the answer it
-        // is for, so an answer of that type goes to the Call itself — by name,
-        // which is what lets two Calls await the same type and what keeps a
-        // stale answer off a live wait. Anything else is a different exit from
-        // the same place, an ordinary Signal for 'the attempt failed', and those
-        // are chosen by type as they always were.
-        $transition = $call->accepts($reply->payload)
-            ? $call->getName()
-            : $this->signalAccepting($workflow, $subject, $reply->payload, $reply->callerId);
-
-        if ($transition === null) {
-            return [];
-        }
-
-        [, $dispatch, $outbox] = $this->applyAndPersist(
-            $caller,
-            $reply->callerId,
-            $state,
-            $workflow,
-            $subject,
-            $transition,
-            [self::SIGNAL_CONTEXT_KEY => $reply->payload],
-        );
-
-        $this->perform($outbox);
-
-        return $dispatch;
-    }
-
-    /**
-     * The one enabled Signal that accepts $payload, for an answer the Call it came
-     * from does not await.
-     *
-     * Null when nothing does — the caller declared no exit for this outcome, which
-     * is its own graph's business — and an exception when several do, because
-     * guessing between them is worse than saying so.
-     */
-    private function signalAccepting(
-        WorkflowInterface $workflow,
-        object $subject,
-        object $payload,
-        string $sagaId,
-    ): ?string {
-        $matching = array_values(array_filter(
-            $this->enabledSignals($workflow, $subject),
-            static fn(Signal $signal): bool => $signal->accepts($payload),
-        ));
-
-        if ($matching === []) {
-            return null;
-        }
-
-        if (count($matching) > 1) {
-            $names = implode(', ', array_map(static fn(Signal $s): string => $s->getName(), $matching));
-            $payloadClass = $payload::class;
-
-            throw new SagaException("Saga '$sagaId' has more than one signal accepting a $payloadClass "
-                . "($names). Narrow their awaited types, or guard all but one of them.");
-        }
-
-        return $matching[0]->getName();
-    }
-
     /**
      * Records a launch for every Call the saga has just parked on.
      *
@@ -1133,6 +804,7 @@ final readonly class SagaRunner
         }
 
         $this->assertRollbackIsNotIncomplete($state, $sagaId);
+        $this->assertNotAwaitingCollection($state, $sagaId);
         $this->assertMarkingIsNotEmpty($state, $sagaId);
 
         $subject = $state->subject;
@@ -1140,7 +812,11 @@ final readonly class SagaRunner
 
         $this->assertMarkingStillFits($workflow, $state, $sagaId);
         $this->assertTransitionStillExists($workflow, $sagaId, $transition);
-        $this->assertNotASignal($workflow, $sagaId, $transition);
+
+        $call = $this->callNamed($workflow, $transition);
+        if ($call === null) {
+            $this->assertNotASignal($workflow, $sagaId, $transition);
+        }
 
         // Marking's constructor takes place => token count, so the counts survive
         // the round trip instead of collapsing to one token each.
@@ -1154,7 +830,88 @@ final readonly class SagaRunner
             return [false, [], new SagaOutbox()];
         }
 
-        return $this->applyAndPersist($saga, $sagaId, $state, $workflow, $subject, $transition, []);
+        // A queued step whose transition is a Call means one thing: the saga it
+        // launched has finished and its result is waiting to be read. That is the
+        // whole collection mechanism — no message payload, no second entry point,
+        // no answer object.
+        $context = [];
+        if ($call !== null) {
+            $result = $this->resultOf($call, $workflow, $state, $sagaId);
+            if ($result === null) {
+                return [false, [], new SagaOutbox()];
+            }
+            $context = [self::SIGNAL_CONTEXT_KEY => $result];
+        }
+
+        return $this->applyAndPersist($saga, $sagaId, $state, $workflow, $subject, $transition, $context);
+    }
+
+    /**
+     * The {@see Call} by that name, if the transition is one.
+     */
+    private function callNamed(WorkflowInterface $workflow, string $transition): ?Call
+    {
+        foreach ($workflow->getDefinition()->getTransitions() as $candidate) {
+            if ($candidate->getName() === $transition && $candidate instanceof Call) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Reads a finished child's final subject, and retires its row.
+     *
+     * Null when there is nothing to collect, and the step then does nothing rather
+     * than failing. Three ways that happens, all of them ordinary:
+     *
+     *  - the child is gone. Someone collected it already, or a sweep cleared it.
+     *  - the child is still running. The notification cannot have come from it, so
+     *    it is a redelivery of one already handled.
+     *  - the child belongs to a DIFFERENT attempt than the wait now in progress.
+     *    A caller that gave up on a deadline and tried again must not have the
+     *    abandoned attempt close its new wait — measured before this existed, a
+     *    checkout settled on a payment it had itself written off while the live
+     *    one answered into nothing.
+     *
+     * The row is deleted here rather than by the child, because until now it was
+     * the only copy of the result. Deleting it under the CALLER's lock is safe:
+     * the child is finished, so nothing else will touch it.
+     */
+    private function resultOf(
+        Call $call,
+        WorkflowInterface $workflow,
+        SagaState $state,
+        string $sagaId,
+    ): ?object {
+        $parking = null;
+        foreach ($call->getFroms() as $from) {
+            if (isset($state->marking[$from])) {
+                $parking = $from;
+                break;
+            }
+        }
+
+        if ($parking === null) {
+            return null;
+        }
+
+        $attempt = $this->timesEntered($workflow, $state->history, $parking);
+        $childId = $this->recordedChildId($state->history, $call->getName(), $attempt);
+        if ($childId === null) {
+            return null;
+        }
+
+        $child = $this->repository->load($childId);
+        if ($child === null || !in_array(self::COMPLETED, $child->history, true)) {
+            return null;
+        }
+
+        $result = $child->subject;
+        $this->repository->delete($childId);
+
+        return $result;
     }
 
     /**
@@ -1183,8 +940,6 @@ final readonly class SagaRunner
         $workflow->apply($subject, $transition, [
             self::SAGA_ID_CONTEXT_KEY => $sagaId,
             self::OUTBOX_CONTEXT_KEY => $outbox,
-            self::CALLER_CONTEXT_KEY => $this->callerOf($state),
-            self::CHILD_CONTEXT_KEY => $this->childrenOf($state),
             ...$context,
         ]);
 
@@ -1206,9 +961,32 @@ final readonly class SagaRunner
         )];
 
         // Terminal: nothing enabled and nothing structurally outgoing. The saga
-        // reached a place that accepts no further moves — clean up and exit.
+        // reached a place that accepts no further moves.
         if ($enabled === [] && !$this->hasOutgoingTransitions($workflow, $newMarking)) {
-            $this->repository->delete($sagaId);
+            $caller = $this->callerOf($state);
+
+            if ($caller === null) {
+                $this->repository->delete($sagaId);
+
+                return [true, [], $outbox];
+            }
+
+            // A saga that was launched by a Call outlives its own completion by one
+            // step. Its final subject IS its result, and the row is where that
+            // result lives until the caller's step has read it — which is what
+            // spares the queue message a payload and spares the package a second
+            // place where a subject is serialised. The marker is what tells the
+            // difference between a saga still running and one waiting to be
+            // collected.
+            $this->repository->save(new SagaState(
+                $state->id,
+                $this->markingToArray($newMarking),
+                $subject,
+                [...$history, self::COMPLETED],
+                $state->version + 1,
+            ));
+
+            $outbox->add(new NotifyCaller($caller[0], $caller[1], $caller[2]));
 
             return [true, [], $outbox];
         }
@@ -1505,6 +1283,21 @@ final readonly class SagaRunner
             $attempt = $this->timesEntered($workflow, $state->history, $parking);
             $childSubject = $transition->subjectFor($state->subject);
 
+            $recorded = $this->recordedChildId($state->history, $transition->getName(), $attempt);
+            if ($recorded !== null) {
+                $child = $this->repository->load($recorded);
+
+                if ($child !== null && in_array(self::COMPLETED, $child->history, true)) {
+                    // The child finished and the message telling this saga about it
+                    // never arrived. Recoverable only because the result is still in
+                    // the child's row — an answer that had been sent and dropped
+                    // would have left nothing to find.
+                    $outbox->add(new NotifyCaller($saga::class, $sagaId, $transition->getName()));
+
+                    continue;
+                }
+            }
+
             // The recorded id, never a fresh one: this is the technical-retry path,
             // and minting here is what turned one payment into a payment per sweep.
             // Nothing recorded means the launch was never collected, so falling
@@ -1582,6 +1375,23 @@ final readonly class SagaRunner
      * leftover job, or a late signal, would move it forward and re-run steps that
      * have already been undone.
      */
+    /**
+     * Refuses to advance a saga that has finished and is waiting to be collected.
+     *
+     * Such a row looks alive — it has a marking and a subject — and it is not. A
+     * leftover job for the step that ended it, or a signal arriving late, would
+     * otherwise move it on and re-run work whose result the caller may already
+     * have read.
+     */
+    private function assertNotAwaitingCollection(SagaState $state, string $sagaId): void
+    {
+        if (in_array(self::COMPLETED, $state->history, true)) {
+            throw new SagaException("Saga '$sagaId' has finished and is waiting for the ".Call::class
+                . ' that launched it to collect its result. It cannot be advanced: its subject is now a '
+                . 'result being read, not state being changed.');
+        }
+    }
+
     private function assertRollbackIsNotIncomplete(SagaState $state, string $sagaId): void
     {
         if (in_array(self::ROLLBACK_FAILED, $state->history, true)) {

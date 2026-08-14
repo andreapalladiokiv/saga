@@ -7,46 +7,41 @@ namespace Techork\Saga\Tests;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Symfony\Component\EventDispatcher\EventDispatcher;
-use Symfony\Component\Workflow\Arc;
-use Symfony\Component\Workflow\Definition;
 use Symfony\Component\Workflow\Event\GuardEvent;
 use Symfony\Component\Workflow\Event\TransitionEvent;
 use Symfony\Component\Workflow\Registry;
 use Symfony\Component\Workflow\SupportStrategy\InstanceOfSupportStrategy;
-use Symfony\Component\Workflow\Transition;
 use Symfony\Component\Workflow\Workflow;
-use Techork\Saga\Call;
-use Techork\Saga\InMemorySagaQueue;
 use Techork\Saga\InMemorySagaStateRepository;
 use Techork\Saga\InProcessSagaLock;
 use Techork\Saga\Saga;
 use Techork\Saga\SagaException;
-use Techork\Saga\SagaLocator;
 use Techork\Saga\SagaMarkingStore;
 use Techork\Saga\SagaQueue;
 use Techork\Saga\SagaRunner;
 use Techork\Saga\Signal;
-use Techork\Saga\SignalOutcome;
-use Techork\Saga\Tests\Call\CaptureRequested;
 use Techork\Saga\Tests\Call\ChallengeFailed;
 use Techork\Saga\Tests\Call\ChallengePassed;
 use Techork\Saga\Tests\Call\CheckoutSaga;
 use Techork\Saga\Tests\Call\CheckoutSubject;
-use Techork\Saga\Tests\Call\PaymentAuthorized;
-use Techork\Saga\Tests\Call\PaymentDeclined;
 use Techork\Saga\Tests\Call\PaymentIntentSaga;
 use Techork\Saga\Tests\Call\PaymentIntentSubject;
+use Throwable;
 
-use function array_shift;
 use function sprintf;
 
 /**
- * A Call is a Signal that runs another saga while it waits.
+ * A Call runs another saga and resumes when it ENDS, taking that saga's final
+ * subject as the payload.
  *
- * What these pin is mostly about WHERE things happen: the launch and the answer
- * are performed by the runner outside the saga lock, which is the difference
- * between this and a bridge written by hand — the latter deadlocks under an
- * inline queue driver, and these tests run every case under one.
+ * Nothing is answered and nothing is sent: a saga's state is its subject, so its
+ * result is its subject, and it reports by finishing. One writer per row follows —
+ * the child owns its subject while it lives, the caller only reads it, afterwards.
+ *
+ * What these mostly pin is WHERE things happen. The launch and the collection are
+ * performed by the runner outside the saga lock, which is the difference between
+ * this and a bridge written by hand: the latter deadlocks under an inline queue
+ * driver, and every test here runs under one.
  */
 final class CallTest extends TestCase
 {
@@ -67,18 +62,8 @@ final class CallTest extends TestCase
     /** @var list<string> */
     private array $log = [];
 
-    /**
-     * class => saga, shared by reference with the inline queue and the locator so
-     * a test can register a parent of its own and have both find it.
-     *
-     * @var array<class-string<Saga>, Saga>
-     */
+    /** @var array<class-string<Saga>, Saga> shared by reference with the inline queue */
     private array $sagas = [];
-
-    /** Both exits out of `declined` are guarded; the tests open the one they mean. */
-    private bool $allowRetry = false;
-
-    private bool $allowAbandon = false;
 
     protected function setUp(): void
     {
@@ -86,14 +71,14 @@ final class CallTest extends TestCase
         $this->dispatcher = new EventDispatcher;
         $this->registry = new Registry;
         $this->markingStore = new SagaMarkingStore;
-        $this->checkout = new CheckoutSaga;
         $this->intent = new PaymentIntentSaga;
+        $this->checkout = new CheckoutSaga($this->intent);
     }
 
     /**
-     * Every test runs on an INLINE driver — push() executes the step at once.
-     * That is the setting a hand-written bridge cannot survive, so it is the one
-     * worth defaulting to.
+     * Every test runs on an INLINE driver — push() executes the step at once. That
+     * is the setting a hand-written bridge cannot survive, so it is the one worth
+     * defaulting to.
      */
     private function boot(): void
     {
@@ -110,6 +95,13 @@ final class CallTest extends TestCase
             public function push(string $sagaClass, string $sagaId, string $transition, int $delaySeconds = 0): void
             {
                 $this->log[] = "step:$transition#$sagaId";
+
+                // a test drops a saga from the map to make a push fail on purpose,
+                // standing in for a worker that could not resolve it
+                if (! isset($this->sagas[$sagaClass])) {
+                    throw new RuntimeException("no worker for $sagaClass");
+                }
+
                 $this->runner?->run($this->sagas[$sagaClass], $sagaId, $transition);
             }
         };
@@ -121,7 +113,6 @@ final class CallTest extends TestCase
             $this->registry,
             $this->markingStore,
             new InProcessSagaLock,
-            $this->locator(),
         );
 
         $queue->runner = $this->runner;
@@ -136,66 +127,35 @@ final class CallTest extends TestCase
             new InstanceOfSupportStrategy(PaymentIntentSubject::class),
         );
 
+        // the caller reads the child's subject and writes its own
         $this->on(CheckoutSaga::class, 'pay', function (TransitionEvent $e): void {
-            $answer = Signal::payload($e, PaymentAuthorized::class);
-            $e->getSubject()->authCode = $answer->authCode;
-            $this->log[] = 'checkout:authorized:'.$answer->authCode;
-        });
-        $this->on(CheckoutSaga::class, 'payment_declined', function (TransitionEvent $e): void {
-            $this->log[] = 'checkout:declined:'.Signal::payload($e, PaymentDeclined::class)->reason;
+            $result = Signal::payload($e, PaymentIntentSubject::class);
+            $e->getSubject()->authCode = $result->authCode;
+            $e->getSubject()->declineReason = $result->declined;
+            $this->log[] = 'checkout:collected:'.($result->authCode ?? $result->declined);
         });
         $this->on(CheckoutSaga::class, 'settle', function (): void {
             $this->log[] = 'checkout:settled';
         });
+        $this->on(CheckoutSaga::class, 'abandon', function (): void {
+            $this->log[] = 'checkout:abandoned';
+        });
 
-        $this->dispatcher->addListener(sprintf('workflow.%s.guard.retry', CheckoutSaga::class),
-            function (GuardEvent $e): void {
-                if (! $this->allowRetry) {
-                    $e->setBlocked(true);
-                }
-            });
-        $this->dispatcher->addListener(sprintf('workflow.%s.guard.abandon', CheckoutSaga::class),
-            function (GuardEvent $e): void {
-                if (! $this->allowAbandon) {
-                    $e->setBlocked(true);
-                }
-            });
+        // one Call, one target: the branch afterwards is a guard on copied data
+        $this->guard(CheckoutSaga::class, 'settle', static fn (GuardEvent $e): bool
+            => $e->getSubject()->authCode !== null);
+        $this->guard(CheckoutSaga::class, 'abandon', static fn (GuardEvent $e): bool
+            => $e->getSubject()->authCode === null);
 
-        // the child answers; it names no target, because it cannot
+        // the child only ever writes its own subject
         $this->on(PaymentIntentSaga::class, 'challenge_passed', function (TransitionEvent $e): void {
-            $code = Signal::payload($e, ChallengePassed::class)->authCode;
-            $e->getSubject()->authCode = $code;
+            $e->getSubject()->authCode = Signal::payload($e, ChallengePassed::class)->authCode;
             $this->log[] = 'intent:passed';
-            SagaRunner::reply($e, new PaymentAuthorized($code));
         });
         $this->on(PaymentIntentSaga::class, 'challenge_failed', function (TransitionEvent $e): void {
-            $reason = Signal::payload($e, ChallengeFailed::class)->reason;
+            $e->getSubject()->declined = Signal::payload($e, ChallengeFailed::class)->reason;
             $this->log[] = 'intent:failed';
-            SagaRunner::reply($e, new PaymentDeclined($reason));
         });
-    }
-
-    private function locator(): SagaLocator
-    {
-        return new class($this->sagas) implements SagaLocator
-        {
-            /** @param array<class-string<Saga>, Saga> $sagas */
-            public function __construct(private array &$sagas) {}
-
-            public function get(string $sagaClass): Saga
-            {
-                return $this->sagas[$sagaClass] ?? throw new SagaException("unknown $sagaClass");
-            }
-        };
-    }
-
-    private function registerParent(Saga $saga): void
-    {
-        $this->sagas[$saga::class] = $saga;
-        $this->registry->addWorkflow(
-            new Workflow($saga->definition(), $this->markingStore, $this->dispatcher, $saga::class),
-            new InstanceOfSupportStrategy(CheckoutSubject::class),
-        );
     }
 
     private function on(string $sagaClass, string $transition, callable $listener): void
@@ -203,10 +163,22 @@ final class CallTest extends TestCase
         $this->dispatcher->addListener(sprintf('workflow.%s.transition.%s', $sagaClass, $transition), $listener);
     }
 
-    /** The id the runner derives; no test may invent its own. */
-    private function childOf(string $parentId, string $transition, int $step): string
+    private function guard(string $sagaClass, string $transition, callable $allow): void
     {
-        return "$parentId/$transition/$step";
+        $this->dispatcher->addListener(
+            sprintf('workflow.%s.guard.%s', $sagaClass, $transition),
+            static function (GuardEvent $e) use ($allow): void {
+                if (! $allow($e)) {
+                    $e->setBlocked(true);
+                }
+            },
+        );
+    }
+
+    /** The id the runner derives; no test may invent its own. */
+    private function childOf(string $parentId, string $transition, int $attempt): string
+    {
+        return "$parentId/$transition/$attempt";
     }
 
     // ───────────────── the launch ─────────────────
@@ -216,42 +188,29 @@ final class CallTest extends TestCase
         $this->boot();
         $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
 
-        $child = $this->childOf('chk-1', 'pay', 1);
-        $state = $this->repository->load($child);
+        $state = $this->repository->load($this->childOf('chk-1', 'pay', 1));
 
-        self::assertNotNull($state, 'the child must exist once the parent parked on the Call');
+        self::assertNotNull($state, 'the child must exist once the caller parked on the Call');
         self::assertInstanceOf(PaymentIntentSubject::class, $state->subject);
-        self::assertSame('ord-1', $state->subject->reference, 'the Call builds the subject from the parent’s');
+        self::assertSame('ord-1', $state->subject->reference, 'the Call builds the subject from the caller’s');
         self::assertSame(['awaiting_challenge' => 1], $state->marking);
     }
 
-    public function testTheChildIsBuiltFromWhatTheStepJustWroteNotFromTheStoredRow(): void
+    public function testBothSagasParkWhileTheChallengeIsOutstanding(): void
     {
-        // The step that carries the saga into the parking place is usually the
-        // one that obtained what the child needs — a signal folding in a card,
-        // say. Building the child's subject from the row as it was BEFORE that
-        // step loses exactly that.
-        $this->boot();
-        $this->on(CheckoutSaga::class, 'place', function (TransitionEvent $e): void {
-            $e->getSubject()->amount = '99.00';
-        });
-
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        $child = $this->repository->load($this->childOf('chk-1', 'pay', 1));
-        self::assertNotNull($child);
-        self::assertInstanceOf(PaymentIntentSubject::class, $child->subject);
-        self::assertSame('99.00', $child->subject->amount);
-    }
-
-    public function testTheParentParksOnTheCallAndNothingIsQueuedForIt(): void
-    {
+        // The shape the mechanism exists for: the caller is parked because its child
+        // has not finished, the child because it is waiting on something outside,
+        // and neither has anything queued against it.
         $this->boot();
         $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
 
         self::assertSame(['awaiting_payment' => 1], $this->repository->load('chk-1')?->marking);
+        self::assertSame(
+            ['awaiting_challenge' => 1],
+            $this->repository->load($this->childOf('chk-1', 'pay', 1))?->marking,
+        );
         self::assertSame(['step:place#chk-1', 'step:create#chk-1/pay/1'], $this->log,
-            'a Call is a Signal, so the runner queues it for nobody');
+            'nothing further is queued for either of them');
     }
 
     public function testTheChildKnowsNothingAboutItsCaller(): void
@@ -267,248 +226,10 @@ final class CallTest extends TestCase
         }
     }
 
-    public function testTwoCallsMayLeaveOnePlaceWhenTheirGuardsMakeThemExclusive(): void
+    // ───────────────── the result ─────────────────
+
+    public function testTheCallFiresWhenTheChildEndsAndCarriesItsFinalSubject(): void
     {
-        // The shape is legitimate and common: one wait, two kinds of child, the
-        // guards choosing. Rejecting it over the definition alone rejected the
-        // shape instead of the fault.
-        $saga = new class implements Saga
-        {
-            public function definition(): Definition
-            {
-                return new Definition(['a', 'card', 'plan'], [
-                    new Call('open_payment', 'a', 'card',
-                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('card-'.$s->orderId, $s->amount)),
-                    new Call('open_subscription_payment', 'a', 'plan',
-                        runs: PaymentIntentSaga::class, awaits: PaymentDeclined::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('plan-'.$s->orderId, $s->amount)),
-                ], ['a']);
-            }
-        };
-        $this->boot();
-        $this->registerParent($saga);
-
-        // no plan: the subscription Call is blocked
-        $this->dispatcher->addListener(sprintf('workflow.%s.guard.open_subscription_payment', $saga::class),
-            static fn (GuardEvent $e) => $e->setBlocked(true));
-
-        $this->runner->start($saga, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        self::assertNotNull($this->repository->load('chk-1/open_payment/1'), 'the guard-selected Call ran');
-        self::assertNull($this->repository->load('chk-1/open_subscription_payment/1'), 'the blocked one did not');
-        self::assertSame(['a' => 1], $this->repository->load('chk-1')?->marking,
-            'and the caller is still parked: a Call moves only when the answer comes');
-    }
-
-    public function testASagaBornParkedOnACallReportsItsFirstAttemptAsOne(): void
-    {
-        // Arriving in an initial place is an entry that no transition records, so
-        // without counting it the first attempt here would be 0 while every other
-        // first attempt is 1 — a difference an id rule taking $attempt would see.
-        $saga = new class implements Saga
-        {
-            public function definition(): Definition
-            {
-                return new Definition(['waiting', 'done'], [
-                    new Call('ask', 'waiting', 'done',
-                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject($s->orderId, $s->amount)),
-                ], ['waiting']);
-            }
-        };
-        $this->boot();
-        $this->registerParent($saga);
-
-        $this->runner->start($saga, 'chk-3', new CheckoutSubject('ord-3', '10.00'));
-
-        self::assertNotNull($this->repository->load('chk-3/ask/1'));
-    }
-
-    public function testAForkMayRunOneCallPerBranchAtTheSameTime(): void
-    {
-        // The refusal is per PLACE, not per step, so a Petri-net fork with a Call
-        // on each branch launches both children and waits for both answers. The
-        // two Calls must await different types, or the answer cannot be routed.
-        $saga = new class implements Saga
-        {
-            public function definition(): Definition
-            {
-                return new Definition(['start', 'left', 'right', 'got_left', 'got_right', 'done'], [
-                    new Transition('split', 'start', ['left', 'right']),
-                    new Call('ask_left', 'left', 'got_left',
-                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('l-'.$s->orderId, $s->amount)),
-                    new Call('ask_right', 'right', 'got_right',
-                        runs: PaymentIntentSaga::class, awaits: PaymentDeclined::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('r-'.$s->orderId, $s->amount)),
-                    new Transition('join', ['got_left', 'got_right'], 'done'),
-                ], ['start']);
-            }
-        };
-        $this->boot();
-        $this->registerParent($saga);
-
-        $this->runner->start($saga, 'fork-1', new CheckoutSubject('ord-f', '10.00'));
-
-        $left = 'fork-1/ask_left/1';
-        $right = 'fork-1/ask_right/1';
-        self::assertNotNull($this->repository->load($left), 'both branches launched');
-        self::assertNotNull($this->repository->load($right));
-        $parent = $this->repository->load('fork-1');
-        self::assertNotNull($parent);
-        self::assertEqualsCanonicalizing(['left' => 1, 'right' => 1], $parent->marking);
-
-        // each child answers its own caller; the join waits for both
-        $this->runner->signal($this->intent, $left, new ChallengePassed('auth-l'));
-        $parent = $this->repository->load('fork-1');
-        self::assertNotNull($parent);
-        self::assertEqualsCanonicalizing(['got_left' => 1, 'right' => 1], $parent->marking,
-            'one answer in, the other branch still waiting');
-
-        $this->runner->signal($this->intent, $right, new ChallengeFailed('nope'));
-
-        self::assertNull($this->repository->load('fork-1'), 'the join fired and the saga finished');
-    }
-
-    public function testOnePlaceHoldingTwoTokensMayRunTwoCallsOutOfIt(): void
-    {
-        // The refusal is arithmetic, not per place: firing a Call consumes a
-        // token, so a place holding two can see two of its Calls through.
-        $saga = new class implements Saga
-        {
-            public function definition(): Definition
-            {
-                return new Definition(['start', 'both', 'a_done', 'b_done'], [
-                    new Transition('split', 'start', [new Arc('both', 2)]),
-                    new Call('ask_a', 'both', 'a_done',
-                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('a-'.$s->orderId, $s->amount)),
-                    new Call('ask_b', 'both', 'b_done',
-                        runs: PaymentIntentSaga::class, awaits: PaymentDeclined::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('b-'.$s->orderId, $s->amount)),
-                ], ['start']);
-            }
-        };
-        $this->boot();
-        $this->registerParent($saga);
-
-        $this->runner->start($saga, 'two-1', new CheckoutSubject('ord-t', '10.00'));
-
-        self::assertSame(['both' => 2], $this->repository->load('two-1')?->marking);
-        self::assertNotNull($this->repository->load('two-1/ask_a/1'), 'both Calls launched');
-        self::assertNotNull($this->repository->load('two-1/ask_b/1'));
-    }
-
-    public function testTwoCallsFireableOutOfOnePlaceBothRunAndOnlyOneAnswerIsUsed(): void
-    {
-        // Whether that graph is a good idea is the author's business — the engine
-        // executes the net as written. One token, so the first answer carries it
-        // away and the second cannot fire: dropped, not raised. What the engine
-        // must not do is mistake it for the answer to a live wait.
-        $saga = new class implements Saga
-        {
-            public function definition(): Definition
-            {
-                return new Definition(['a', 'b', 'c', 'end'], [
-                    new Call('one', 'a', 'b',
-                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('x', $s->amount)),
-                    new Call('two', 'a', 'c',
-                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
-                        subject: static fn (CheckoutSubject $s): object
-                            => new PaymentIntentSubject('y', $s->amount)),
-                    // keeps `b` non-terminal so the row survives for inspection
-                    new Signal('after_b', 'b', 'end', awaits: PaymentDeclined::class),
-                ], ['a']);
-            }
-        };
-        $this->boot();
-        $this->registerParent($saga);
-
-        $this->runner->start($saga, 'chk-2', new CheckoutSubject('ord-2', '49.99'));
-
-        // both children exist: launches are collected before any answer can arrive
-        self::assertNotNull($this->repository->load('chk-2/one/1'));
-        self::assertNotNull($this->repository->load('chk-2/two/1'));
-
-        // both await the same type, which type-based routing could not tell apart
-        $this->runner->signal($this->intent, 'chk-2/one/1', new ChallengePassed('auth-1'));
-        $parent = $this->repository->load('chk-2');
-        self::assertNotNull($parent);
-        self::assertSame(['b' => 1], $parent->marking,
-            'the answer went to the Call that launched it, not to whichever awaited its type');
-
-        $this->runner->signal($this->intent, 'chk-2/two/1', new ChallengePassed('auth-2'));
-        $parent = $this->repository->load('chk-2');
-        self::assertNotNull($parent);
-        self::assertSame(['b' => 1], $parent->marking,
-            'the token is gone, so the second answer is dropped rather than applied somewhere');
-    }
-
-    public function testAnAnswerFromAnAbandonedAttemptIsNotAppliedToTheCurrentOne(): void
-    {
-        // Measured before the fix: the caller gave up on a deadline, retried, then
-        // heard from the abandoned child — and accepted that answer as the current
-        // attempt's, finishing, while the child it was waiting for answered into
-        // nothing. The graph is correct here; the engine had the attempt number
-        // and ignored it.
-        $this->boot();
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        $first = $this->childOf('chk-1', 'pay', 1);
-        self::assertNotNull($this->repository->load($first));
-
-        // the deadline passes: the caller declines and retries while child 1 runs
-        $this->runner->signal($this->checkout, 'chk-1', new PaymentDeclined('deadline'));
-        $this->allowRetry = true;
-        $this->runner->run($this->checkout, 'chk-1', 'retry');
-
-        $second = $this->childOf('chk-1', 'pay', 2);
-        self::assertNotNull($this->repository->load($second), 'attempt 2 is under way');
-        self::assertNotNull($this->repository->load($first), 'attempt 1 is still running');
-
-        // the abandoned child answers, late
-        $this->runner->signal($this->intent, $first, new ChallengePassed('stale'));
-
-        self::assertSame(['awaiting_payment' => 1], $this->repository->load('chk-1')?->marking,
-            'a stale answer must not settle the wait that is actually in progress');
-        self::assertNotContains('checkout:authorized:stale', $this->log);
-
-        // and the child the caller is waiting for still can
-        $this->runner->signal($this->intent, $second, new ChallengePassed('auth-2'));
-        self::assertContains('checkout:authorized:auth-2', $this->log);
-    }
-
-    // ───────────────── the answer ─────────────────
-
-    public function testTheChildsAnswerFiresTheCallAndCarriesItsPayload(): void
-    {
-        $this->boot();
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        $this->runner->signal($this->intent, $this->childOf('chk-1', 'pay', 1), new ChallengePassed('auth-77'));
-
-        self::assertContains('checkout:authorized:auth-77', $this->log);
-        self::assertContains('checkout:settled', $this->log);
-        self::assertNull($this->repository->load('chk-1'), 'the checkout ran to the end');
-        self::assertSame(['authorized' => 1], $this->repository->load($this->childOf('chk-1', 'pay', 1))?->marking,
-            'the child stays alive after answering, waiting to be told whether to capture');
-    }
-
-    public function testTheAnswerIsDeliveredWithNoLockHeldSoAnInlineDriverDoesNotDeadlock(): void
-    {
-        // The whole point. A listener that called signal() on the caller from
-        // inside the child's step would re-enter the caller's lock; the runner
-        // delivers the answer after releasing the child's.
         $this->boot();
         $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
 
@@ -518,180 +239,119 @@ final class CallTest extends TestCase
             'step:place#chk-1',
             'step:create#chk-1/pay/1',
             'intent:passed',
-            'checkout:authorized:auth-77',
+            'step:pay#chk-1',
+            'checkout:collected:auth-77',
             'step:settle#chk-1',
             'checkout:settled',
         ], $this->log);
+        self::assertNull($this->repository->load('chk-1'), 'the caller ran to the end');
+        self::assertNull($this->repository->load($this->childOf('chk-1', 'pay', 1)),
+            'and the collected child is gone');
     }
 
-    public function testAnAnswerOfTheWrongTypeTakesTheOtherExitFromTheSamePlace(): void
+    public function testTheOutcomeIsDataSoTheCallerBranchesOnWhatItCopied(): void
     {
         $this->boot();
         $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
 
         $this->runner->signal($this->intent, $this->childOf('chk-1', 'pay', 1), new ChallengeFailed('no funds'));
 
-        self::assertContains('checkout:declined:no funds', $this->log);
-        self::assertSame(['declined' => 1], $this->repository->load('chk-1')?->marking,
-            'payment_declined is an ordinary Signal out of the parking place');
+        self::assertContains('checkout:collected:no funds', $this->log);
+        self::assertContains('checkout:abandoned', $this->log,
+            'one Call, one target — the outcome is data the caller branches on');
     }
 
-    public function testASagaCanAskWhetherAnyoneCalledIt(): void
+    public function testCollectionArrivesAsAnOrdinaryQueuedStep(): void
     {
-        // The same saga runs both ways: launched by a Call, and started directly
-        // by an endpoint. It has to be able to tell, without matching on the text
-        // of an exception.
+        // The child reaches its end inside its own lock. Telling the caller from
+        // there would take a second lock while holding the first, which under an
+        // inline driver comes straight back for the child. The runner queues the
+        // caller's Call instead, once the lock is released — so the collection is
+        // just another step, and there is no second entry point to the runner.
         $this->boot();
-
-        $seen = [];
-        $this->on(PaymentIntentSaga::class, 'create', function (TransitionEvent $e) use (&$seen): void {
-            // asked in order to do something ELSE when standalone, not in order
-            // to decide whether replying is safe — reply() handles that itself
-            $seen[SagaRunner::sagaId($e)] = SagaRunner::hasCaller($e);
-        });
-
         $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-        $this->runner->start($this->intent, 'pi-direct', new PaymentIntentSubject('ord-9', '5.00'));
 
-        self::assertTrue($seen[$this->childOf('chk-1', 'pay', 1)] ?? null, 'a child has a caller');
-        self::assertFalse($seen['pi-direct'] ?? null, 'one started directly has none');
-    }
-
-    public function testASagaWithNoCallerSimplyDoesNotAnswer(): void
-    {
-        // The same saga, run on its own. Reusability is the point of the design,
-        // so answering nobody must not be an error — otherwise every reply site in
-        // every reusable saga needs a hasCaller() guard around it.
-        $this->boot();
-
-        $this->runner->start($this->intent, 'pi-standalone', new PaymentIntentSubject('ord-9', '5.00'));
-        $outcome = $this->runner->signal($this->intent, 'pi-standalone', new ChallengePassed('auth-x'));
-
-        self::assertSame(SignalOutcome::Applied, $outcome, 'the step runs as it would for a child');
-        self::assertContains('intent:passed', $this->log, 'including its reply(), which reaches nobody');
-        self::assertSame(['authorized' => 1], $this->repository->load('pi-standalone')?->marking,
-            'and it parks on its own next wait exactly as a child would');
-    }
-
-    // ───────────────── the caller talking back down ─────────────────
-
-    public function testTheCallerCanTellItsChildSomethingAfterTheCallHasFired(): void
-    {
-        // The chain a hand-written bridge cannot survive, end to end and under an
-        // inline driver: the checkout launches the intent, the intent answers, the
-        // checkout settles and then instructs the intent to capture. Doing that
-        // last step with signal() from inside a listener re-enters the intent's
-        // lock — the intent's own step is what is running — and both sagas are left
-        // split-brained. Declared, it is two outbox actions and no held lock.
-        $this->boot();
-        $this->on(CheckoutSaga::class, 'settle', function (TransitionEvent $e): void {
-            SagaRunner::tell($e, 'pay', new CaptureRequested($e->getSubject()->amount));
-        });
-        $this->on(PaymentIntentSaga::class, 'capture', function (TransitionEvent $e): void {
-            $this->log[] = 'intent:captured:'.Signal::payload($e, CaptureRequested::class)->amount;
-        });
-
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
         $this->runner->signal($this->intent, $this->childOf('chk-1', 'pay', 1), new ChallengePassed('auth-77'));
 
-        self::assertSame([
-            'step:place#chk-1',
-            'step:create#chk-1/pay/1',
-            'intent:passed',
-            'checkout:authorized:auth-77',
-            'step:settle#chk-1',
-            'checkout:settled',
-            'intent:captured:49.99',
-        ], $this->log);
-        self::assertNull($this->repository->load('chk-1'), 'the checkout finished');
-        self::assertNull($this->repository->load($this->childOf('chk-1', 'pay', 1)), 'and so did the intent');
+        self::assertContains('step:pay#chk-1', $this->log);
     }
 
-    public function testTellingACallThatHasLaunchedNothingIsRefused(): void
+    public function testAnExternalSignalCannotFireACall(): void
     {
-        // Unlike reply(), the target here is a name — so it can be got wrong, and
-        // a typo would otherwise be a message that silently goes nowhere.
+        // A Call's wait belongs to its child. Letting a webhook satisfy it would
+        // close a wait whose child is still running.
         $this->boot();
-        $this->on(CheckoutSaga::class, 'place', function (TransitionEvent $e): void {
-            SagaRunner::tell($e, 'paay', new CaptureRequested('1.00'));
-        });
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
 
+        $this->expectException(SagaException::class);
+
+        $this->runner->signal($this->checkout, 'chk-1', new PaymentIntentSubject('ord-1', '49.99'));
+    }
+
+    public function testAFinishedChildCannotBeAdvancedWhileItWaitsToBeCollected(): void
+    {
+        // Such a row looks alive and is not: its subject is a result being read, not
+        // state being changed. A leftover job or a late signal must not move it.
+        $this->boot();
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+        $child = $this->childOf('chk-1', 'pay', 1);
+
+        // make the notification fail, so the finished row stays put
+        $this->sagas = [PaymentIntentSaga::class => $this->intent];
         try {
-            $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-            self::fail('a Call name that launched nothing must be refused');
-        } catch (SagaException $e) {
-            self::assertStringContainsString("'paay'", $e->getMessage());
+            $this->runner->signal($this->intent, $child, new ChallengePassed('auth-77'));
+        } catch (Throwable) {
+            // the push could not resolve the caller — that is the lost notification
         }
+
+        $finished = $this->repository->load($child);
+        self::assertNotNull($finished, 'the finished child is still there, holding its result');
+
+        $this->expectException(SagaException::class);
+        $this->expectExceptionMessageMatches('/waiting for the .*Call/');
+
+        $this->runner->signal($this->intent, $child, new ChallengeFailed('too late'));
     }
 
-    public function testTellingAChildThatHasAlreadyFinishedIsSilent(): void
-    {
-        // Symmetric with an answer arriving for a caller that is gone: there is
-        // nobody to hear it, and that is not a fault of this saga.
-        $this->boot();
-        $this->on(CheckoutSaga::class, 'settle', function (TransitionEvent $e): void {
-            SagaRunner::tell($e, 'pay', new CaptureRequested('49.99'));
-        });
+    // ───────────────── recovery ─────────────────
 
+    public function testRequeueTellsTheCallerAgainWhenTheNotificationWasLost(): void
+    {
+        // The hole the old arrangement could not close: an answer that was sent and
+        // dropped left nothing behind to find. Now the result waits in the child's
+        // row, so the sweep can see it and tell the caller again.
+        $this->boot();
         $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
         $child = $this->childOf('chk-1', 'pay', 1);
-        $this->runner->signal($this->intent, $child, new ChallengePassed('auth-77'));
 
-        // it answered and was then removed before the caller got round to it
-        $this->repository->delete($child);
-        self::assertNull($this->repository->load($child));
+        $this->sagas = [PaymentIntentSaga::class => $this->intent];
+        try {
+            $this->runner->signal($this->intent, $child, new ChallengePassed('auth-77'));
+        } catch (Throwable) {
+            // lost notification
+        }
 
-        // nothing raised, and the caller is unaffected
-        self::assertNull($this->repository->load('chk-1'));
-    }
-
-    // ───────────────── retries and recovery ─────────────────
-
-    public function testASecondAttemptGetsItsOwnChild(): void
-    {
-        $this->boot();
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-        $this->runner->signal($this->intent, $this->childOf('chk-1', 'pay', 1), new ChallengeFailed('no funds'));
-
-        $this->allowRetry = true;
-        $this->runner->run($this->checkout, 'chk-1', 'retry');
-
-        // the attempt number counts entries into the parking place, so the second
-        // wait is 2 regardless of how many other steps the parent took
-        $second = $this->childOf('chk-1', 'pay', 2);
-        self::assertNotNull($this->repository->load($second),
-            'a parent that loops back into the parking place must not collide with the first child');
+        self::assertNotNull($this->repository->load($child));
         self::assertSame(['awaiting_payment' => 1], $this->repository->load('chk-1')?->marking);
-    }
 
-    public function testARedeliveredStepDoesNotStartASecondChild(): void
-    {
-        $this->boot();
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        $before = $this->repository->load($this->childOf('chk-1', 'pay', 1));
-        $this->runner->run($this->checkout, 'chk-1', 'place');       // already applied
-        $after = $this->repository->load($this->childOf('chk-1', 'pay', 1));
-
-        self::assertNotNull($before);
-        self::assertNotNull($after);
-        self::assertSame($before->version, $after->version, 'the child must be untouched');
-    }
-
-    public function testRequeueRecreatesAChildTheParentIsWaitingForButWhichIsGone(): void
-    {
-        // The one hole a Call leaves: the parent commits and the process dies
-        // before the launch runs. Recoverable only because the id is derived.
-        $this->boot();
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        $child = $this->childOf('chk-1', 'pay', 1);
-        $this->repository->delete($child);
-        self::assertNull($this->repository->load($child));
-
+        $this->sagas = [CheckoutSaga::class => $this->checkout, PaymentIntentSaga::class => $this->intent];
         $this->runner->requeue($this->checkout, 'chk-1');
 
-        self::assertNotNull($this->repository->load($child), 'the sweep must recreate the missing child');
+        self::assertContains('checkout:collected:auth-77', $this->log);
+        self::assertNull($this->repository->load('chk-1'), 'the caller finished after all');
+        self::assertNull($this->repository->load($child), 'and the child was retired');
+    }
+
+    public function testARedeliveredCollectionDoesNothing(): void
+    {
+        $this->boot();
+        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
+        $this->runner->signal($this->intent, $this->childOf('chk-1', 'pay', 1), new ChallengePassed('auth-77'));
+
+        $before = $this->log;
+        $this->runner->run($this->checkout, 'chk-1', 'pay');
+
+        self::assertSame($before, $this->log, 'there is nothing left to collect');
     }
 
     public function testAStepThatThrowsLaunchesNothing(): void
@@ -708,97 +368,7 @@ final class CallTest extends TestCase
             // expected
         }
 
-        self::assertNull($this->repository->load($this->childOf('chk-1', 'place', 1)));
         self::assertNull($this->repository->load($this->childOf('chk-1', 'pay', 1)),
             'a step that never persisted must not have started anything');
-    }
-
-    // ───────────────── the other driver ─────────────────
-
-    public function testTheSameFlowRunsOnAQueueThatDefersEveryStep(): void
-    {
-        // The inline driver is the hard case for locks; a real queue is the hard
-        // case for ordering, because a step that is merely enqueued has not run.
-        // Both must produce the same outcome.
-        $pending = [];
-        $queue = new class($pending) implements SagaQueue
-        {
-            /** @param list<array{class-string<Saga>, string, string}> $pending */
-            public function __construct(private array &$pending) {}
-
-            public function push(string $sagaClass, string $sagaId, string $transition, int $delaySeconds = 0): void
-            {
-                $this->pending[] = [$sagaClass, $sagaId, $transition];
-            }
-        };
-
-        $this->sagas = [CheckoutSaga::class => $this->checkout, PaymentIntentSaga::class => $this->intent];
-        $runner = new SagaRunner(
-            $this->repository,
-            $queue,
-            $this->dispatcher,
-            $this->registry,
-            $this->markingStore,
-            new InProcessSagaLock,
-            $this->locator(),
-        );
-        $this->registry->addWorkflow(
-            new Workflow($this->checkout->definition(), $this->markingStore, $this->dispatcher, CheckoutSaga::class),
-            new InstanceOfSupportStrategy(CheckoutSubject::class),
-        );
-        $this->registry->addWorkflow(
-            new Workflow($this->intent->definition(), $this->markingStore, $this->dispatcher, PaymentIntentSaga::class),
-            new InstanceOfSupportStrategy(PaymentIntentSubject::class),
-        );
-        $this->on(PaymentIntentSaga::class, 'challenge_passed', function (TransitionEvent $e): void {
-            SagaRunner::reply($e, new PaymentAuthorized(Signal::payload($e, ChallengePassed::class)->authCode));
-        });
-        $this->on(CheckoutSaga::class, 'pay', function (TransitionEvent $e): void {
-            $e->getSubject()->authCode = Signal::payload($e, PaymentAuthorized::class)->authCode;
-        });
-
-        $sagas = [CheckoutSaga::class => $this->checkout, PaymentIntentSaga::class => $this->intent];
-        $drain = static function () use (&$pending, $runner, $sagas): void {
-            $guard = 0;
-            while ($pending !== [] && $guard++ < 20) {
-                [$class, $id, $transition] = array_shift($pending);
-                $runner->run($sagas[$class], $id, $transition);
-            }
-        };
-
-        $runner->start($this->checkout, 'chk-q', new CheckoutSubject('ord-q', '49.99'));
-        $drain();
-
-        $child = $this->childOf('chk-q', 'pay', 1);
-        self::assertNotNull($this->repository->load($child), 'the child is launched on a real queue too');
-        self::assertSame(['awaiting_payment' => 1], $this->repository->load('chk-q')?->marking);
-
-        $runner->signal($this->intent, $child, new ChallengePassed('auth-q'));
-        $drain();
-
-        self::assertNull($this->repository->load('chk-q'), 'the checkout settled and finished');
-        self::assertSame(['authorized' => 1], $this->repository->load($child)?->marking);
-    }
-
-    // ───────────────── compensation ─────────────────
-
-    public function testCompensationSkipsTheRunnersOwnHistoryMarkers(): void
-    {
-        $this->boot();
-        $this->runner->start($this->checkout, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-
-        $compensated = [];
-        $this->dispatcher->addListener(
-            sprintf('saga.%s.compensate.create', PaymentIntentSaga::class),
-            function () use (&$compensated): void {
-                $compensated[] = 'create';
-            },
-        );
-
-        $errors = $this->runner->compensateAndDelete($this->intent, $this->childOf('chk-1', 'pay', 1));
-
-        self::assertSame([], $errors);
-        self::assertSame(['create'], $compensated,
-            'the caller marker in history is not a transition and must not be compensated');
     }
 }

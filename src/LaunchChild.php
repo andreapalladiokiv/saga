@@ -13,7 +13,7 @@ namespace Techork\Saga;
 final readonly class LaunchChild
 {
     /**
-     * @param  class-string<Saga>  $sagaClass  the child
+     * @param  Saga  $saga  the child, as the Call declared it
      * @param  string  $childId  derived, never supplied — see {@see Call}
      * @param  class-string<Saga>  $callerClass
      * @param  string  $callerTransition  the Call's name, so the answer knows which edge to fire
@@ -21,7 +21,7 @@ final readonly class LaunchChild
      *                              so a second attempt cannot silently reuse the first child
      */
     public function __construct(
-        public string $sagaClass,
+        public Saga $saga,
         public string $childId,
         public object $subject,
         public string $callerClass,

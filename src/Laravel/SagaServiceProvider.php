@@ -15,7 +15,6 @@ use Illuminate\Support\ServiceProvider;
 use Symfony\Component\Workflow\Registry;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use Techork\Saga\SagaException;
-use Techork\Saga\SagaLocator;
 use Techork\Saga\SagaLock;
 use Techork\Saga\SagaMarkingStore;
 use Techork\Saga\SagaQueue;
@@ -48,7 +47,6 @@ use Techork\Saga\SystemClock;
  *   - Registry                 -> empty Symfony {@see Registry}; the
  *                                 application registers workflows against it
  *                                 at boot time
- *   - SagaLocator              -> ContainerSagaLocator (sagas may take dependencies)
  *   - SagaRunner               -> composed from the bindings above
  *
  * Publish the migration:
@@ -105,11 +103,6 @@ final class SagaServiceProvider extends ServiceProvider
             return new CacheSagaLock($store);
         });
 
-        $this->app->singleton(
-            SagaLocator::class,
-            static fn (Container $app): SagaLocator => new ContainerSagaLocator($app),
-        );
-
         $this->app->singleton(SagaRunner::class, static fn (Container $app): SagaRunner => new SagaRunner(
             $app->make(SagaStateRepository::class),
             $app->make(SagaQueue::class),
@@ -117,7 +110,6 @@ final class SagaServiceProvider extends ServiceProvider
             $app->make(Registry::class),
             $app->make(SagaMarkingStore::class),
             $app->make(SagaLock::class),
-            $app->make(SagaLocator::class),
         ));
     }
 

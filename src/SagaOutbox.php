@@ -23,15 +23,15 @@ namespace Techork\Saga;
  */
 final class SagaOutbox
 {
-    /** @var list<LaunchChild|DeliverReply|DeliverMessage> */
+    /** @var list<LaunchChild|NotifyCaller> */
     private array $actions = [];
 
-    public function add(LaunchChild|DeliverReply|DeliverMessage $action): void
+    public function add(LaunchChild|NotifyCaller $action): void
     {
         $this->actions[] = $action;
     }
 
-    /** @return list<LaunchChild|DeliverReply|DeliverMessage> launches first: nothing can be said to a child that is not there yet */
+    /** @return list<LaunchChild|NotifyCaller> launches first: nothing can finish before it has started */
     public function actions(): array
     {
         $launches = [];
