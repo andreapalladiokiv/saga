@@ -528,30 +528,6 @@ final readonly class SagaRunner
     }
 
     /**
-     * The id of the child a {@see Call} launched, for a step that runs after the
-     * launch.
-     *
-     * The id is generated once, when the Call hands it out, and written down; this
-     * reads that record. So the step that captures the payment, or the endpoint
-     * answering a webhook about it, can name the child without the launching step
-     * having copied the value into the subject on its way past.
-     *
-     *     $intentId = SagaRunner::childId($event, 'pay');
-     *
-     * The latest attempt's, because that is the one in progress: a business retry
-     * hands out a new id, and the previous attempt's child is done with.
-     *
-     * @param  Event<object>  $event
-     */
-    public static function childId(Event $event, string $call): ?string
-    {
-        $context = method_exists($event, 'getContext') ? $event->getContext() : [];
-        $child = self::childFrom($event, $call);
-
-        return $child === null ? null : $child[0];
-    }
-
-    /**
      * Every Call's latest child, read out of the row's own journal.
      *
      * @return array<string, array{string, class-string<Saga>}> the Call's name => [id, saga class]

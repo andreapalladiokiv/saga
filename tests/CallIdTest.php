@@ -201,25 +201,52 @@ final class CallIdTest extends TestCase
             'the sweep must find the child it already has, not generate another id');
     }
 
-    public function testALaterStepCanReadTheGeneratedChildId(): void
+    public function testTheRecommendedShapeKeepsTheGeneratedIdOnTheSubject(): void
     {
-        // The point of writing the id down: the step that captures the payment,
-        // or an endpoint answering a webhook about it, needs to name the child —
-        // and that is a different step, which is a different process. Nothing has
-        // to be copied into the subject on the way past.
-        $saga = new NamedCallSaga;
+        // The saga's state is the subject and nothing else. A step that needs to
+        // name something outside — a payment intent at a provider — generates the
+        // id and writes it there, and the Call's rule reads it. The rule stays a
+        // pure function of the subject, which is what lets recovery recompute the
+        // same id, and a business retry is a step writing a new one.
+        $saga = new class implements Saga
+        {
+            public function definition(): Definition
+            {
+                return new Definition(['new', 'paying', 'paid'], [
+                    new Transition('open', 'new', 'paying'),
+                    new Call('pay', 'paying', 'paid',
+                        runs: PaymentIntentSaga::class, awaits: PaymentAuthorized::class,
+                        subject: static fn (CheckoutSubject $c): object
+                            => new PaymentIntentSubject((string) $c->declineReason, $c->amount),
+                        id: static fn (PaymentIntentSubject $s): string => $s->reference),
+                ], ['new']);
+            }
+        };
         $this->boot($saga);
 
-        $seen = null;
-        $this->dispatcher->addListener(sprintf('workflow.%s.transition.settle', NamedCallSaga::class),
-            static function (TransitionEvent $e) use (&$seen): void {
-                $seen = SagaRunner::childId($e, 'pay');
+        // the step that decides to pay puts the generated id on the subject
+        $this->dispatcher->addListener(sprintf('workflow.%s.transition.open', $saga::class),
+            static function (TransitionEvent $e): void {
+                $e->getSubject()->declineReason = 'pi_'.bin2hex(random_bytes(8));
             });
 
-        $this->runner->start($saga, 'chk-1', new CheckoutSubject('ord-1', '49.99'));
-        $this->runner->signal($this->intent, 'pi-ord-1-1', new ChallengePassed('auth-9'));
+        $born = [];
+        $this->dispatcher->addListener(sprintf('workflow.%s.transition.create', PaymentIntentSaga::class),
+            static function (TransitionEvent $e) use (&$born): void {
+                $born[] = SagaRunner::sagaId($e);
+            });
 
-        self::assertSame('pi-ord-1-1', $seen, 'the step after the launch reads the id the engine handed out');
+        $this->runner->start($saga, 'chk-s', new CheckoutSubject('ord-s', '49.99'));
+
+        self::assertCount(1, $born);
+        $subject = $this->repository->load('chk-s')?->subject;
+        self::assertInstanceOf(CheckoutSubject::class, $subject);
+        self::assertSame($subject->declineReason, $born[0],
+            'the child is named by what the subject carries, so any later step can rebuild it');
+
+        // and the sweep recomputes the same id from the same subject
+        $this->runner->requeue($saga, 'chk-s');
+        self::assertCount(1, $born, 'nothing duplicated');
     }
 
     public function testABusinessRetryGetsAFreshGeneratedIdWhileATechnicalOneDoesNot(): void
