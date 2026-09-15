@@ -172,6 +172,61 @@ php artisan migrate
 
 Register your workflows against the container's `Registry` in a provider's `boot()`.
 
+### Scaffolding one
+
+`php artisan make:saga OrderSaga` builds a saga a step at a time. It asks for one edge at a time — its kind, its name, the places it leaves and arrives in — validates the graph as a whole after every answer, prints the diagram, and writes what it has:
+
+```
+app/Sagas/
+  OrderSaga.php            the graph, and the blueprint it was rendered from
+  OrderSubject.php         the subject DTO — written once, then yours
+  OrderSagaListeners.php   the listener map — stubs are appended, bodies are yours
+  PaymentReceived.php      a payload DTO, when a Signal awaited a class nobody had written
+```
+
+It finishes by printing the `Registry` snippet as code to paste into a provider. It does not paste it for you: editing a provider it did not create is the one thing a generator must not do.
+
+**The graph lives in a docblock on the generated class, and that block is the source of truth.**
+
+```
+/**
+ * @saga-blueprint
+ * {
+ *     "v": 1,
+ *     "saga": "App\\Sagas\\OrderSaga",
+ *     "subject": "App\\Sagas\\OrderSubject",
+ *     "initial": ["placed"],
+ *     "places": ["placed", "reserved"],
+ *     "steps": [
+ *         {"kind": "transition", "name": "reserve_stock", "from": ["placed"], "to": ["reserved"]}
+ *     ],
+ *     "renderer": 1,
+ *     "bodyHash": "sha256:…"
+ * }
+ * @saga-blueprint:end
+ */
+```
+
+A second run reads it back and appends to it, and that is the whole point of the arrangement: the graph outlives the session that built it, so each run carries on from where the last one stopped. The files are written once, when the wizard ends — the dialogue is held in memory until then, so a run you interrupt before answering *done* writes nothing at all, on a first run or on a later one. **Change the graph here, not in `definition()`** — that method is rendered from this block and would be rewritten by the next run. A hand edit to it is not erased quietly: the command hashes the region between its markers and compares that against the hash the last run stored in `bodyHash`, so anything edited since that write is a hand edit — it refuses, showing the edit both ways, until the change is moved into the blueprint or `--force` says it was deliberate. (It finds out before it asks a single question, so a run that refuses you has written nothing.) Moving the change into the blueprint is enough on its own: an untouched region still hashes to `bodyHash`, which says only the graph moved on. `bodyHash` covers that region alone, not the file, so a method of your own below `@saga:generated:helpers:begin` can change freely.
+
+**Everything above `@saga:generated:helpers:begin` in the saga belongs to the command**, and is rendered again on every run: the namespace, the imports, the docblock, the class declaration, the definition region, and the blank line under its closing marker. Your own code written in there — a property or a constructor right below `final class OrderSaga implements Saga {`, or a method on that blank line — is gone on the next run, and nothing reports it, because the drift check covers `definition()` alone. **Write your members below the `helpers:begin` marker.** A `use` statement you typed in the head is the one exception: it is carried forward verbatim, because losing it would turn a working file into a fatal error at the next request rather than an error now.
+
+From the `helpers:begin` marker down, the command only ever appends. Helper stubs go in above `@saga:generated:helpers:end`, listener stubs above `@saga:listeners:end`, each found by its own marker comment, and a stub that is already there is left exactly as it is. **Never delete a marker without deleting the block under it.** A marker whose step has left the blueprint is reported as orphaned and never removed, and a stub whose marker is gone is written a second time — which costs a listener in the wrong place at worst in the listeners file, because those entries are returned as a keyed map rather than registered one by one, so a duplicate collapses and an action can never run twice for a step that can only be compensated once. In the saga there is no such collapse: a second method of the same name would not compile, so the command checks the declaration as well there, and reports a stub that would collide instead of adding it.
+
+`--path` and `--namespace` say where to write and what to declare, and win over everything else. Otherwise the command reads `saga.generator.path` and `saga.generator.namespace` from `config/saga.php`, which `vendor:publish --tag=saga-config` installs; failing that, it writes to the application's own `app/Sagas` under `App\Sagas`. `--force` does one thing only — it accepts the loss of a hand edit to `definition()`. It never licenses overwriting a saga the command did not write: a file carrying no `@saga-blueprint` is refused outright, because a saga somebody wrote by hand is not this command's to replace.
+
+**A `Signal` waiting for a class that does not exist is refused**, not warned about. `Signal::accepts()` is an `instanceof` against that exact name, so the saga would park where nothing could ever reach it, and the mistake would surface much later as `signal()` reporting that the saga is not waiting for what you sent. When the missing class is one the command may write — same namespace as the saga — the wizard offers to write an empty DTO for it, and the step is kept only if the offer is taken. A class in somebody else's namespace belongs to whoever owns that namespace, and the note says so instead.
+
+A subject or payload DTO is written once and never again. If a file of that name is already in the directory while the class it should declare does not load, the run stops rather than rendering the stub over it: that file is somebody's, and the class not loading is a fact about it. Make it declare the class, or move it aside.
+
+**`Call` is built, and partly left to you.** `Call::$runs` is a ready-made object rather than a class name, and the answer arrives as the child's subject rather than this saga's. Three things follow:
+
+- **The child saga is never generated.** Recursion here would be a second wizard inside the first. A `Call` whose child does not exist yet is a *warning*, not an error, because writing the caller first is the order people actually work in — run `make:saga` for the child when you get to it.
+- **`runs:` is `new PaymentIntentSaga()` when that class exists with a no-argument constructor**, and otherwise a `$this->payChild()` helper stub — named after the step, with a `@todo` — where the container is yours to reach for. A helper rather than a constructor parameter, because a parameter would have to be regenerated every time another `Call` arrived, and a region the command regenerates is one you could never safely edit.
+- **`subject:` is an identity closure when the two sagas share a subject class**, and otherwise a `static function (OrderSubject $subject): PaymentIntentSubject` stub that throws until you write it. Throwing is the honest default: a mapping that quietly returned the wrong object would fail inside the child, without the context that explains why.
+
+None of it asks for `Call::$id`. The default `<parent>/<call>/<attempt>` is correct, and a meaningful id is the saga author's decision rather than the wizard's.
+
 ### Schema
 
 One table, six columns: `id`, `marking`, `subject`, `history`, `version`, timestamps — the original shape, unchanged.
@@ -224,7 +279,7 @@ Two durations answer different questions, and they are coupled:
 
 Sagas outlive them. Renaming a place, or a transition, raises `SagaDefinitionDriftException` — reported rather than compensated, because rolling back is the wrong and irreversible response to a code change. Park those sagas and decide by hand.
 
-Subject DTOs: add properties with defaults, never rename or move the class. Deserialization is restricted to `Saga::subjectClass()`, so a moved class is refused rather than silently materialised as a ghost object.
+Subject DTOs: add properties with defaults, never rename or move the class. The class name is baked into the payload by `serialize()`, and the codec refuses a payload that comes back as `__PHP_Incomplete_Class` — so a class that was moved raises `SagaException` naming the saga, rather than handing a listener an object that reads nulls out of every property.
 
 ---
 

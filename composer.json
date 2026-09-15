@@ -26,6 +26,7 @@
         "phpunit/phpunit": "^11.5 || ^12.0 || ^13.1",
         "illuminate/contracts": "^11.0 || ^12.0 || ^13.0",
         "illuminate/support": "^11.0 || ^12.0 || ^13.0",
+        "illuminate/console": "^11.0 || ^12.0 || ^13.0",
         "illuminate/bus": "^11.0 || ^12.0 || ^13.0",
         "illuminate/cache": "^11.0 || ^12.0 || ^13.0",
         "illuminate/database": "^11.0 || ^12.0 || ^13.0",
@@ -39,6 +40,7 @@
         "illuminate/queue": "Required for Saga\\Laravel integration (^10 || ^11 || ^12 || ^13)",
         "illuminate/contracts": "Required for Saga\\Laravel integration (^10 || ^11 || ^12 || ^13)",
         "illuminate/support": "Required for the optional SagaServiceProvider (^10 || ^11 || ^12 || ^13)",
+        "illuminate/console": "Required for `php artisan make:saga`, the step-by-step generator (^11 || ^12 || ^13)",
         "illuminate/cache": "Required for CacheSagaLock, which serialises the steps of one saga. The configured store must support atomic locks \u2014 redis, memcached, dynamodb, database or array; the file store cannot.",
         "symfony/event-dispatcher": "Required for the optional event dispatcher (^7.0 || ^8.0)",
         "illuminate/encryption": "Required for EncryptedSubjectCodec, which authenticates the stored subject so a forged payload is rejected before unserialize() constructs anything. Without it, anyone able to write the sagas table chooses which already-loaded class the queue worker instantiates."

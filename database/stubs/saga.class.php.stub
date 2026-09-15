@@ -1,0 +1,26 @@
+<?php
+
+declare(strict_types=1);
+
+namespace {{ namespace }};
+
+{{ imports }}/**
+ * The {{ class }} saga.
+ *
+ * The block below, between the two markers, is this saga's graph — and it is
+ * the source of truth. The command reads it back to carry on where it left off,
+ * so edit the graph there, or re-run the command, rather than editing
+ * `definition()`, which is rewritten from it. A hand edit to `definition()` is
+ * reported rather than silently overwritten.
+ *
+{{ blueprint }}
+ */
+final class {{ class }} implements Saga
+{
+    // @saga:generated:definition:start
+{{ definition }}
+    // @saga:generated:definition:end
+
+    // @saga:generated:helpers:begin
+    // @saga:generated:helpers:end
+}

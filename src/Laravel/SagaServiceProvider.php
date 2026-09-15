@@ -14,6 +14,7 @@ use Illuminate\Database\ConnectionResolverInterface;
 use Illuminate\Support\ServiceProvider;
 use Symfony\Component\Workflow\Registry;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
+use Techork\Saga\Laravel\Console\MakeSagaCommand;
 use Techork\Saga\SagaException;
 use Techork\Saga\SagaLock;
 use Techork\Saga\SagaMarkingStore;
@@ -49,13 +50,23 @@ use Techork\Saga\SystemClock;
  *                                 at boot time
  *   - SagaRunner               -> composed from the bindings above
  *
- * Publish the migration:
+ * Publish the migration and the generator's config:
  *     php artisan vendor:publish --tag=saga-migrations
+ *     php artisan vendor:publish --tag=saga-config
  */
 final class SagaServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
+        // Guarded because there may be no config repository to merge into: the
+        // provider is resolvable against a bare container, which is how it is
+        // tested, and `mergeConfigFrom()` would throw there. The config is a
+        // convenience in any case — `make:saga` falls back to the application's
+        // own `app/Sagas` when nothing says otherwise.
+        if ($this->app->bound('config')) {
+            $this->mergeConfigFrom(__DIR__ . '/../../config/saga.php', 'saga');
+        }
+
         $this->app->singleton(SagaStateRepository::class, static function (Container $app): SagaStateRepository {
             /** @var ConnectionResolverInterface $resolver */
             $resolver = $app->make('db');
@@ -115,13 +126,22 @@ final class SagaServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
-        if ($this->app->runningInConsole()) {
-            $stub = __DIR__ . '/../../database/migrations/create_sagas_table.php.stub';
-            $this->publishes(
-                [$stub => $this->migrationTarget('create_sagas_table.php')],
-                'saga-migrations',
-            );
+        if (! $this->app->runningInConsole()) {
+            return;
         }
+
+        $stub = __DIR__ . '/../../database/migrations/create_sagas_table.php.stub';
+        $this->publishes(
+            [$stub => $this->migrationTarget('create_sagas_table.php')],
+            'saga-migrations',
+        );
+
+        $this->publishes(
+            [__DIR__ . '/../../config/saga.php' => $this->app->configPath('saga.php')],
+            'saga-config',
+        );
+
+        $this->commands([MakeSagaCommand::class]);
     }
 
     private function migrationTarget(string $filename): string

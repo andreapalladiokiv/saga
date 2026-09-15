@@ -1,0 +1,21 @@
+<?php
+
+declare(strict_types=1);
+
+namespace {{ namespace }};
+
+/**
+ * The subject of the {{ saga }} saga: the state its steps mutate.
+ *
+ * It is serialized into the saga's row after every step, so its shape is part
+ * of a deploy. Add properties with defaults, and never rename or move the
+ * class — a saga parked in a place is holding an instance of this, not a copy
+ * of the code that made it.
+ *
+ * It has to stay mutable: a listener folds what a step learned into the subject
+ * in place, because a payload does not outlive the apply it arrived with.
+ */
+final class {{ class }}
+{
+    // @todo add the state this saga carries
+}

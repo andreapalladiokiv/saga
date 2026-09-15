@@ -51,6 +51,7 @@ jobs:
             "phpunit/phpunit:${{ matrix.phpunit }}" \
             "illuminate/contracts:${{ matrix.laravel }}" \
             "illuminate/support:${{ matrix.laravel }}" \
+            "illuminate/console:${{ matrix.laravel }}" \
             "illuminate/bus:${{ matrix.laravel }}" \
             "illuminate/cache:${{ matrix.laravel }}" \
             "illuminate/database:${{ matrix.laravel }}" \
@@ -65,7 +66,7 @@ jobs:
       - name: Syntax check on the target PHP
         # Polyfills cannot fix syntax. Only a real parse on the minimum version
         # catches a typed class constant or an #[\Override] slipping in.
-        run: find src tests -name '*.php' -print0 | xargs -0 -n1 -P4 php -l
+        run: find src tests config -name '*.php' -print0 | xargs -0 -n1 -P4 php -l
 
       - name: Tests
         run: vendor/bin/phpunit

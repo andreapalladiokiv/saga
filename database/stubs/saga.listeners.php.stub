@@ -1,0 +1,41 @@
+<?php
+
+declare(strict_types=1);
+
+namespace {{ namespace }};
+
+{{ imports }}/**
+ * Every listener the {{ class }} saga needs.
+ *
+ * A saga's graph says what may happen; this file says what happens when it
+ * does. Nothing attaches them for you: call {@see register()} once, from a
+ * provider's `boot()`.
+ *
+ * The entries are returned as a map keyed by event name rather than registered
+ * one by one, and that is deliberate. A duplicate key in a literal array
+ * collapses silently, so if a step's marker is ever lost the worst case is a
+ * listener in the wrong place — never two listeners for one transition, which
+ * would run an action twice for a step that can only be compensated once.
+ *
+ * Entries are added above the closing marker and never rewritten: whatever you
+ * write inside that region is yours, and a stub whose step no longer exists is
+ * reported rather than removed.
+ */
+final class {{ class }}Listeners
+{
+    public static function register(Dispatcher $events): void
+    {
+        foreach (self::listeners() as $name => $listener) {
+            $events->listen($name, $listener);
+        }
+    }
+
+    /** @return array<string, callable> */
+    private static function listeners(): array
+    {
+        return [
+            // @saga:listeners:begin
+            // @saga:listeners:end
+        ];
+    }
+}

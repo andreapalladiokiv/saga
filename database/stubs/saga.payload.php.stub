@@ -1,0 +1,21 @@
+<?php
+
+declare(strict_types=1);
+
+namespace {{ namespace }};
+
+/**
+ * What the "{{ step }}" step of {{ saga }} waits for.
+ *
+ * A Signal matches its payload with an `instanceof` against this class, so the
+ * `signal()` call that wakes the saga has to be handed an instance of exactly
+ * this type — a subclass counts, an unrelated object never does.
+ *
+ * Nothing reads these fields for you: add what the wait has to carry, and fold
+ * it into the subject in the step's transition listener, because the payload
+ * does not survive its own apply.
+ */
+final class {{ class }}
+{
+    // @todo add the properties this payload carries, and a constructor for them
+}
