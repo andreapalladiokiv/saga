@@ -134,12 +134,26 @@ Three states follow, all derived from the definition and the marking with nothin
 **Firing it.** Only from outside, with a payload:
 
 ```php
-$outcome = $runner->signal($saga, $link->id, new PaymentReceived(
+$runner->signal($saga, $link->id, new PaymentReceived(
     card: $request->cardMask(), address: $request->billingAddress(),
 ));
 ```
 
-Of the Signals currently enabled, exactly one must `accepts()` the payload. Zero raises an error naming what the saga is actually waiting for; more than one is an ambiguous definition. `run()` on a Signal is refused outright — it would advance the saga past its own wait with no data. `SignalOutcome` is `Applied` or `NotFound`; a late signal for a finished saga is not an error.
+Of the Signals currently enabled, exactly one must `accepts()` the payload. Zero raises an error naming what the saga is actually waiting for; more than one is an ambiguous definition. `run()` on a Signal is refused outright — it would advance the saga past its own wait with no data.
+
+A signal that lands nowhere raises, both ways it can miss. `SagaNotWaitingException` when the saga is there but nothing enabled accepts the payload; `SagaNotFoundException`, a subtype of it, when no saga holds the id at all. The second is genuinely ambiguous — the saga finished and its row is gone, or the id is simply wrong — and the doubt goes to the wrong id, because `signal()` takes its id from outside where a mistyped string is the likelier of the two and silence would make it permanent. (`run()` stays silent on a missing saga: its id comes from a queue message the runner wrote itself.)
+
+Both misses have one cause often enough — a redelivered announcement — that one catch covers them:
+
+```php
+try {
+    $runner->signal($checkout, $checkoutId, new PaymentAuthorized(...));
+} catch (SagaNotWaitingException) {
+    // already applied on an earlier delivery
+}
+```
+
+Catch it only where a duplicate is genuinely expected; everywhere else letting it escape is the point.
 
 **Handling it.** A signal's listener is an ordinary transition listener. The only difference is that the payload is in the apply context:
 

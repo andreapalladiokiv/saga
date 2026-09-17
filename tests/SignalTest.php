@@ -19,9 +19,10 @@ use Techork\Saga\SagaDefinitionDriftException;
 use Techork\Saga\SagaException;
 use Techork\Saga\SagaLock;
 use Techork\Saga\SagaMarkingStore;
+use Techork\Saga\SagaNotFoundException;
+use Techork\Saga\SagaNotWaitingException;
 use Techork\Saga\SagaRunner;
 use Techork\Saga\Signal;
-use Techork\Saga\SignalOutcome;
 use Techork\Saga\Tests\Checkout\CheckoutSaga;
 use Techork\Saga\Tests\Checkout\CheckoutSubject;
 use Techork\Saga\Tests\Checkout\OperatorRelease;
@@ -128,12 +129,11 @@ final class SignalTest extends TestCase
         $this->runner->start($this->saga, 'chk-2', new CheckoutSubject('49.99'));
         $this->drain();
 
-        $outcome = $this->runner->signal($this->saga, 'chk-2', new PaymentReceived(
+        $this->runner->signal($this->saga, 'chk-2', new PaymentReceived(
             card: '411111******1111',
             address: 'Riva del Vin 12, Venezia',
         ));
 
-        self::assertSame(SignalOutcome::Applied, $outcome);
         self::assertSame(['PAYMENT 411111******1111'], $this->log);
 
         // The listener folded it in, so it is durable and later steps see it.
@@ -200,9 +200,8 @@ final class SignalTest extends TestCase
         $this->runner->start($this->saga, 'chk-6', new CheckoutSubject('49.99'));
         $this->drain();
 
-        $outcome = $this->runner->signal($this->saga, 'chk-6', new ApplePayReceived('4111', 'Riva'));
+        $this->runner->signal($this->saga, 'chk-6', new ApplePayReceived('4111', 'Riva'));
 
-        self::assertSame(SignalOutcome::Applied, $outcome);
         self::assertSame(['PAYMENT 4111'], $this->log);
     }
 
@@ -218,12 +217,40 @@ final class SignalTest extends TestCase
         $this->runner->signal($this->saga, 'chk-7', new PaymentReceived('4111', 'Riva'));
     }
 
-    public function testSignallingASagaThatNoLongerExistsIsNotAnError(): void
+    public function testSignallingASagaThatIsNotThereIsRefused(): void
     {
-        $outcome = $this->runner->signal($this->saga, 'gone', new PaymentReceived('4111', 'Riva'));
+        // Indistinguishable from a mistyped id, and the id came from outside, so
+        // the doubt goes to the typo rather than to the late arrival.
+        try {
+            $this->runner->signal($this->saga, 'gone', new PaymentReceived('4111', 'Riva'));
+            self::fail('a signal that lands nowhere must not pass silently');
+        } catch (SagaNotFoundException $e) {
+            self::assertStringContainsString("id 'gone'", $e->getMessage());
+            self::assertStringContainsString(PaymentReceived::class, $e->getMessage());
+        }
 
-        self::assertSame(SignalOutcome::NotFound, $outcome);
         self::assertTrue($this->queue->isEmpty());
+    }
+
+    public function testACallerExpectingLateSignalsCatchesEitherWayOfMissing(): void
+    {
+        // The two ways one redelivered announcement can miss — the saga finished
+        // and its row is gone, or it is still there but already consumed the
+        // signal — are one catch, because they are one cause.
+        $this->runner->start($this->saga, 'chk-9', new CheckoutSubject('49.99'));
+        $this->drain();
+        $this->runner->signal($this->saga, 'chk-9', new PaymentReceived('4111', 'Riva'));
+
+        $missed = 0;
+        foreach (['chk-9', 'gone'] as $id) {
+            try {
+                $this->runner->signal($this->saga, $id, new PaymentReceived('4111', 'Riva'));
+            } catch (SagaNotWaitingException) {
+                $missed++;
+            }
+        }
+
+        self::assertSame(2, $missed);
     }
 
     public function testTwoSimultaneousSignalsCannotBothLand(): void

@@ -29,7 +29,6 @@ use Techork\Saga\SagaMarkingStore;
 use Techork\Saga\SagaNotWaitingException;
 use Techork\Saga\SagaRunner;
 use Techork\Saga\SagaState;
-use Techork\Saga\SignalOutcome;
 use Techork\Saga\Tests\Laravel\Console\Fixtures\ScriptedSagaPrompter;
 
 use function class_exists;
@@ -131,10 +130,7 @@ final class GeneratedSagaRunsTest extends TestCase
         self::assertSame(['reserved' => 1], $this->state('order-1')->marking, 'it stays parked');
 
         // The payload it does accept, through the listener the command wrote.
-        self::assertSame(
-            SignalOutcome::Applied,
-            $runner->signal($saga, 'order-1', new $payload()),
-        );
+        $runner->signal($saga, 'order-1', new $payload());
 
         self::assertNull($this->repository->load('order-1'), 'paid is terminal, so the row goes');
     }

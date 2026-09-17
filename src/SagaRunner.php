@@ -351,34 +351,41 @@ final readonly class SagaRunner
      * Runs under the same {@see SagaLock} and the same optimistic-lock save as
      * every other write, so two simultaneous signals end with one applied.
      *
-     * A saga that no longer exists is not an error — a signal may legitimately
-     * arrive late.
+     * A signal that does not land raises. That includes a saga that is no longer
+     * there, which may well be a legitimately late arrival — see
+     * {@see SagaNotFoundException} for why the doubt goes the other way — and a
+     * caller expecting late signals says so by catching
+     * {@see SagaNotWaitingException}, which covers both ways a duplicate can miss.
      *
-     * @throws SagaException when nothing enabled accepts the payload, when more
-     *                       than one Signal does, or when the rollback is
-     *                       incomplete
+     * @throws SagaNotFoundException when no saga holds this id
+     * @throws SagaNotWaitingException when nothing enabled accepts the payload
+     * @throws SagaException when more than one Signal does, or when the rollback
+     *                       is incomplete
      */
-    public function signal(Saga $saga, string $sagaId, object $payload): SignalOutcome
+    public function signal(Saga $saga, string $sagaId, object $payload): void
     {
-        /** @var array{SignalOutcome, list<string>, SagaOutbox} $result */
+        /** @var array{list<string>, SagaOutbox} $result */
         $result = $this->lock->withLock(
             $sagaId,
             fn(): array => $this->signalExclusively($saga, $sagaId, $payload),
         );
 
-        [$outcome, $dispatch, $outbox] = $result;
+        [$dispatch, $outbox] = $result;
         $this->dispatch($saga, $sagaId, $dispatch);
         $this->perform($outbox);
-
-        return $outcome;
     }
 
-    /** @return array{SignalOutcome, list<string>, SagaOutbox} */
+    /** @return array{list<string>, SagaOutbox} */
     private function signalExclusively(Saga $saga, string $sagaId, object $payload): array
     {
         $state = $this->repository->load($sagaId);
         if ($state === null) {
-            return [SignalOutcome::NotFound, [], new SagaOutbox()];
+            $payloadClass = $payload::class;
+
+            throw new SagaNotFoundException("No saga holds the id '$sagaId', so the $payloadClass "
+                . 'signalled to it went nowhere. Either it finished or was rolled back and this '
+                . 'arrival is late, or the id is wrong. Catch '.SagaNotWaitingException::class
+                . ' where a late arrival is expected.');
         }
 
         $this->assertRollbackIsNotIncomplete($state, $sagaId);
@@ -430,7 +437,7 @@ final readonly class SagaRunner
             [self::SIGNAL_CONTEXT_KEY => $payload],
         );
 
-        return [SignalOutcome::Applied, $dispatch, $outbox];
+        return [$dispatch, $outbox];
     }
 
     /**
@@ -798,8 +805,11 @@ final readonly class SagaRunner
         $state = $this->repository->load($sagaId);
         if ($state === null) {
             // Race: saga was already completed/canceled by a concurrent step.
-            // Nothing to do — silently skip rather than throw, since a signal
-            // from outside may legitimately race with the forward path.
+            // Nothing to do — silently skip rather than throw, and deliberately
+            // unlike signal(), which raises on the same condition. The id here
+            // came from a queue message the runner itself wrote, so a missing row
+            // can only be this race; signal() is handed an id from outside, where
+            // it can simply be wrong.
             return [false, [], new SagaOutbox()];
         }
 
